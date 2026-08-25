@@ -1,0 +1,24 @@
+# Runtime state written under DATA_DIR (default: this directory)
+debts/
+proofs/
+ledger
+heartbeat
+log
+logs/
+*.state
+
+# Local config and secrets
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[co]
+.venv/
+.pytest_cache/
+
+# Pre-edit copies left beside edited files
+*.bak-*
+
+# macOS
+.DS_Store
