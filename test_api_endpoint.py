@@ -12,6 +12,10 @@ The four crash/money invariants, by test name:
   test_kill_inside_pay_to_redeem_window_exactly_one_payment
   test_corrupt_ledger_pauses_purchases_never_intake
   test_anchored_detector_against_real_proofs
+
+INFLIGHT > 1 (several gateway submissions in the air at once) is pinned by
+TestInflight against FreeDoorGateway, a stub that measures how many
+submissions it holds per fingerprint and in total.
 """
 
 import base64
@@ -81,6 +85,9 @@ class FakeLightning:
         self.fail_pay_fps = set()
         self.fail_next_pays = 0
         self.auth_failures = 0
+        self.pay_delay = 0.0        # hold each payment open, so overlap would show
+        self.inflight_pays = 0
+        self.max_inflight_pays = 0  # the most payments ever open at once
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -119,10 +126,17 @@ class FakeLightning:
                 if self.path == "/payinvoice":
                     with outer.lock:
                         outer.pay_calls.append(invoice)
+                        outer.inflight_pays += 1
+                        outer.max_inflight_pays = max(outer.max_inflight_pays,
+                                                      outer.inflight_pays)
                         fail = any(fp in invoice for fp in outer.fail_pay_fps)
                         if not fail and outer.fail_next_pays > 0:
                             outer.fail_next_pays -= 1
                             fail = True
+                    if outer.pay_delay:
+                        time.sleep(outer.pay_delay)
+                    with outer.lock:
+                        outer.inflight_pays -= 1
                     if fail:
                         self._json(200, {"reason": "payment failed"})
                     else:
@@ -284,6 +298,69 @@ class FakeGateway:
     def upgrades_for(self, fp):
         with self.lock:
             return self.upgrade_calls.count(fp)
+
+
+class FreeDoorGateway(FakeGateway):
+    """The gateway's free door (L402_ENABLED=false): /timestamp answers
+    200 + a pending proof, no challenge. Knobs, each read under the lock per
+    request: challenge_delay holds every answer open so several can be in
+    the air together; free_left counts down free answers (None = free
+    forever), after which the door is FakeGateway's paid one (402 +
+    challenge); rate_limit answers 429 with Retry-After; fail_first[fp] = n
+    answers 500 to fp's first n submissions. It measures what the service
+    may never do: the most submissions ever open for one fingerprint, and
+    the most open in total — so a test can pin once-per-fingerprint while
+    proving the concurrency was real."""
+
+    def __init__(self):
+        super().__init__()
+        self.challenge_delay = 0.0
+        self.free_left = None
+        self.rate_limit = False
+        self.retry_after = 2
+        self.fail_first = {}
+        self.inflight_fp = {}
+        self.max_inflight_fp = 0
+        self.inflight_total = 0
+        self.max_inflight_total = 0
+
+    def _challenge(self, h, digest):
+        with self.lock:
+            self.inflight_fp[digest] = self.inflight_fp.get(digest, 0) + 1
+            self.max_inflight_fp = max(self.max_inflight_fp, self.inflight_fp[digest])
+            self.inflight_total += 1
+            self.max_inflight_total = max(self.max_inflight_total, self.inflight_total)
+        try:
+            if self.challenge_delay:
+                time.sleep(self.challenge_delay)
+            with self.lock:
+                if self.fail_first.get(digest, 0) > 0:
+                    self.fail_first[digest] -= 1
+                    mode = "fail"
+                elif self.rate_limit:
+                    mode = "limited"
+                elif self.free_left is None or self.free_left > 0:
+                    if self.free_left is not None:
+                        self.free_left -= 1
+                    mode = "free"
+                else:
+                    mode = "paid"
+                if mode != "paid":
+                    self.challenges.append(digest)
+            if mode == "paid":
+                super()._challenge(h, digest)  # records the challenge itself
+            elif mode == "free":
+                h._raw(200, pending_ots(digest),
+                       {"Content-Type": "application/octet-stream"})
+            elif mode == "limited":
+                h._json(429, {"detail": "slow down"},
+                        {"Retry-After": str(self.retry_after)})
+            else:
+                h._json(500, {"detail": "transient"})
+        finally:
+            with self.lock:
+                self.inflight_fp[digest] -= 1
+                self.inflight_total -= 1
 
 
 # service subprocess runner
@@ -967,6 +1044,267 @@ class TestKillPayRedeemWindow(IntegrationBase):
         self.assertFalse(os.path.exists(self.debt_file(fp)))
         self.assertFalse(os.path.exists(self.sidecar_file(fp)))
         self.assertIn("bought fp=" + fp, self.read_service_log())
+
+
+# INFLIGHT: several gateway submissions in the air at once
+class TestInflightConfig(unittest.TestCase):
+    def test_inflight_knob_strict_positive_int_default_one(self):
+        d = tempfile.mkdtemp(prefix="inflight-cfg-")
+        self.addCleanup(shutil.rmtree, d, True)
+        base = {"LISTEN_ADDR": "127.0.0.1:8402", "GATEWAY_URL": "http://x"}
+        self.assertEqual(api_endpoint.resolve_config(base, script_dir=d)["inflight"], 1)
+        self.assertEqual(api_endpoint.resolve_config(dict(base, INFLIGHT="8"),
+                                                     script_dir=d)["inflight"], 8)
+        self.assertEqual(api_endpoint.resolve_config(dict(base, INFLIGHT=""),
+                                                     script_dir=d)["inflight"], 1)
+        for bad in ("0", "-1", "1.5", "eight", "+2", " 2"):
+            with self.assertRaises(api_endpoint.ConfigError, msg=repr(bad)) as cm:
+                api_endpoint.resolve_config(dict(base, INFLIGHT=bad), script_dir=d)
+            self.assertIn("INFLIGHT", str(cm.exception))
+
+
+class TestInflight(IntegrationBase):
+    """Every test here runs the service at INFLIGHT=8 against FreeDoorGateway
+    and asserts, besides its own claim, that submissions really did overlap
+    (max_inflight_total >= 2) — otherwise the pin would be vacuous."""
+
+    def setUp(self):
+        super().setUp()
+        self.gw.shutdown()
+        self.gw = FreeDoorGateway()
+
+    def seed_debts(self, n, label):
+        """n debts on disk before the service starts, mtimes one second
+        apart in the past, so the buyer's oldest-first order is exactly the
+        returned list and the first pass sees all of them at once."""
+        os.makedirs(self.data("debts"), exist_ok=True)
+        fps = []
+        base = time.time() - 1000
+        for i in range(n):
+            fp = hashlib.sha256(f"{label} {i}".encode()).hexdigest()
+            with open(self.debt_file(fp), "w") as f:
+                f.write(fp + "\n")
+            os.utime(self.debt_file(fp), (base + i, base + i))
+            fps.append(fp)
+        return fps
+
+    def debts_on_disk(self):
+        try:
+            return sorted(n for n in os.listdir(self.data("debts"))
+                          if api_endpoint.HEX64.fullmatch(n))
+        except OSError:
+            return []
+
+    def test_inflight_sigkill_mid_flight_converges_one_proof_each(self):
+        """kill -9 with eight submissions in the air; after restart every
+        acknowledged record has exactly one proof, no debt survives, and a
+        proof-written-debt-uncleared straggler is absorbed by already_bought
+        without another submission."""
+        self.gw.challenge_delay = 0.15
+        r = self.start_service(INFLIGHT="8")
+        acked = []
+        stop = threading.Event()
+
+        def blaster():
+            for i in range(60):
+                if stop.is_set():
+                    return
+                try:
+                    code, text = post_record(r, f"inflight burst {i}".encode())
+                except Exception:
+                    return
+                if code != 200:
+                    return
+                acked.append(text.split()[1])
+
+        t = threading.Thread(target=blaster)
+        t.start()
+        self.wait_until(
+            lambda: len(acked) >= 12 and self.gw.inflight_total >= 2 and
+            any(n.endswith(".ots") for n in os.listdir(self.data("proofs"))),
+            timeout=30, what="mid-flight state (some bought, several in the air)")
+        r.kill9()
+        stop.set()
+        t.join(timeout=15)
+        snapshot = list(acked)
+        self.assertGreaterEqual(len(snapshot), 12)
+        self.assertGreaterEqual(self.gw.max_inflight_total, 2, "never concurrent")
+        self.assertEqual(self.gw.max_inflight_fp, 1)
+        for fp in snapshot:
+            self.assertTrue(os.path.exists(self.debt_file(fp))
+                            or os.path.exists(self.proof_file(fp)),
+                            f"acked {fp} vanished at kill")
+        owed = [fp for fp in snapshot if os.path.exists(self.debt_file(fp))]
+        self.assertTrue(owed, "kill landed after everything was bought; vacuous")
+        # The submissions that were in the air at the kill still finish at
+        # the stub (their sockets are dead); let them land before counting.
+        self.wait_until(lambda: self.gw.inflight_total == 0,
+                        what="stub drained after the kill")
+        # The straggler the kill cannot be made to produce on demand: proof
+        # on disk, debt still there. Manufacture one from the youngest owed
+        # record, which the killed process never submitted.
+        straggler = owed[-1]
+        self.assertFalse(os.path.exists(self.proof_file(straggler)))
+        api_endpoint.atomic_write(self.proof_file(straggler), pending_ots(straggler))
+        straggler_challenges = self.gw.challenges_for(straggler)
+        self.assertEqual(straggler_challenges, 0)
+        # Restart on the same disk.
+        self.gw.challenge_delay = 0.0
+        r.start()
+        self.wait_until(lambda: not self.debts_on_disk(), timeout=45,
+                        what="every debt settled after restart")
+        log = self.read_service_log()
+        for fp in snapshot:
+            self.assertFalse(os.path.exists(self.debt_file(fp)))
+            self.assertFalse(os.path.exists(self.sidecar_file(fp)))
+            with open(self.proof_file(fp), "rb") as f:
+                self.assertEqual(f.read(), pending_ots(fp))
+            self.assertLessEqual(log.count(f"proof_free fp={fp}"), 1,
+                                 f"{fp} bought more than once")
+        self.assertIn(f"already_bought fp={straggler}", log)
+        self.assertEqual(self.gw.challenges_for(straggler), straggler_challenges,
+                         "the straggler was submitted again instead of absorbed")
+        self.assertEqual(self.gw.max_inflight_fp, 1)
+        # A free door costs nothing: no payment, no reservation.
+        self.assertEqual(len(self.ln.pay_calls), 0)
+        self.assertFalse(os.path.exists(self.data("ledger")))
+
+    def test_inflight_fingerprint_in_flight_at_most_once(self):
+        """No fingerprint is ever submitted twice at the same time — within
+        a pass, across passes (a debt whose submission failed is re-submitted
+        only after the earlier one has answered), and under a duplicate POST."""
+        self.gw.challenge_delay = 0.1
+        fps = self.seed_debts(24, "once")
+        flaky = fps[3]
+        self.gw.fail_first[flaky] = 3  # 500 three times: owed again each pass
+        r = self.start_service(INFLIGHT="8")
+        # A duplicate POST of an owed record while the buyer works: one debt.
+        self.assertEqual(post_record(r, b"once 3")[0], 200)
+        self.wait_until(lambda: not self.debts_on_disk(), timeout=30,
+                        what="every debt settled")
+        self.assertGreaterEqual(self.gw.max_inflight_total, 2, "never concurrent")
+        self.assertEqual(self.gw.max_inflight_fp, 1,
+                         "a fingerprint was in flight twice at once")
+        for fp in fps:
+            self.assertEqual(self.gw.challenges_for(fp), 4 if fp == flaky else 1)
+            with open(self.proof_file(fp), "rb") as f:
+                self.assertEqual(f.read(), pending_ots(fp))
+        self.assertEqual(self.read_service_log().count(f"challenge_failed fp={flaky}"), 3)
+        self.assertEqual(len(self.ln.pay_calls), 0)
+
+    def test_inflight_door_flips_to_paid_mid_pass_goes_serial(self):
+        """Twelve debts, window of eight; the stub answers the first five
+        free, then 402 forever. The three 402s collected from the window and
+        the four debts after it are bought serially: one challenge, one
+        invoice, one reservation, one payment, one redeem per paid debt,
+        payments never overlapping, oldest first."""
+        self.gw.challenge_delay = 0.1
+        self.gw.free_left = 5
+        self.gw.price = 21
+        self.ln.pay_delay = 0.05
+        fps = self.seed_debts(12, "flip")
+        self.start_service(INFLIGHT="8")
+        self.wait_until(lambda: not self.debts_on_disk(), timeout=30,
+                        what="every debt settled")
+        log = self.read_service_log()
+        free = [fp for fp in fps if f"proof_free fp={fp}" in log]
+        paid = [fp for fp in fps if f"bought fp={fp}" in log]
+        self.assertEqual(len(free), 5)
+        self.assertEqual(len(paid), 7)
+        self.assertEqual(set(free) | set(paid), set(fps))
+        self.assertEqual(set(free) & set(paid), set())
+        # The flip landed inside the first window: the free five and three
+        # of the paid seven are among the eight oldest.
+        self.assertTrue(all(fps.index(fp) < 8 for fp in free))
+        self.assertEqual(sum(fps.index(fp) < 8 for fp in paid), 3)
+        self.assertGreaterEqual(self.gw.max_inflight_total, 2, "never concurrent")
+        self.assertEqual(self.gw.max_inflight_fp, 1)
+        # Exactly one of everything per paid debt; nothing for the free ones.
+        for fp in fps:
+            self.assertEqual(self.gw.challenges_for(fp), 1,
+                             "a collected 402 was submitted again")
+        self.assertEqual(len(self.gw.minted), 7)
+        with self.gw.lock:
+            redeems = list(self.gw.redeems)
+        for fp in paid:
+            self.assertEqual(len(self.ln.pays_for_fp(fp)), 1)
+            self.assertEqual(sum(fp in inv for inv in self.ln.decode_calls), 1)
+            self.assertEqual(redeems.count(fp), 1)
+        for fp in free:
+            self.assertEqual(len(self.ln.pays_for_fp(fp)), 0)
+            self.assertEqual(redeems.count(fp), 0)
+        self.assertEqual(api_endpoint.read_ledger(self.data("ledger")),
+                         (api_endpoint.utc_today(), 7 * 21))
+        # Payments never concurrent; paid oldest first.
+        self.assertEqual(self.ln.max_inflight_pays, 1)
+        order = [inv.split(":")[2] for inv in self.ln.pay_calls]
+        self.assertEqual(order, sorted(order, key=fps.index))
+        self.assertEqual(redeems, order)
+        self.assertNotIn("breaker_tripped", log)
+        for fp in fps:
+            self.assertFalse(os.path.exists(self.sidecar_file(fp)))
+
+    def test_inflight_429_stops_new_submissions(self):
+        """429 with Retry-After while eight are in the air: the answers
+        already in flight land, no new submission is issued until the wait
+        elapses, every debt stays, and buying resumes afterwards."""
+        self.gw.challenge_delay = 0.1
+        self.gw.rate_limit = True
+        self.gw.retry_after = 2
+        fps = self.seed_debts(30, "limited")
+        self.start_service(INFLIGHT="8")
+        self.wait_until(lambda: "rate_limited" in self.read_service_log(),
+                        what="rate_limited logged")
+        time.sleep(1.0)  # well inside Retry-After, many poll intervals
+        n = len(self.gw.challenges)
+        self.assertGreaterEqual(n, 1)
+        self.assertLessEqual(n, 8, "submissions were issued under Retry-After")
+        self.assertGreaterEqual(self.gw.max_inflight_total, 2, "never concurrent")
+        self.assertEqual(self.debts_on_disk(), sorted(fps), "a debt was dropped")
+        self.assertEqual(os.listdir(self.data("proofs")), [])
+        self.assertEqual(len(self.ln.pay_calls), 0)
+        self.assertIn("rate_limited wait_secs=2", self.read_service_log())
+        # The wait elapses and the door is open again: everything is bought.
+        self.gw.rate_limit = False
+        self.wait_until(lambda: not self.debts_on_disk(), timeout=30,
+                        what="every debt settled after the wait")
+        self.assertEqual(self.gw.max_inflight_fp, 1)
+        self.assertEqual(len(self.ln.pay_calls), 0)
+
+    def test_inflight_breaker_trips_and_stops_submissions(self):
+        """The paid door from the first debt, every payment refused: the
+        eight 402s collected from one window are paid serially, the third
+        failure trips the breaker, and no further submission or payment is
+        issued while it holds."""
+        self.gw.challenge_delay = 0.05
+        self.gw.free_left = 0
+        self.gw.price = 1
+        self.ln.pay_delay = 0.05
+        fps = self.seed_debts(8, "breaker")
+        for fp in fps:
+            self.ln.fail_pay_fps.add(fp)
+        self.start_service(INFLIGHT="8", CIRCUIT_BREAKER_FAILURES="3",
+                           CIRCUIT_BREAKER_PAUSE_SECS="3600")
+        self.wait_until(lambda: "breaker_tripped" in self.read_service_log(),
+                        what="breaker_tripped logged")
+        time.sleep(0.3)  # many passes while paused
+        self.assertEqual(len(self.ln.pay_calls), 3,
+                         "attempts continued after the breaker tripped")
+        self.assertEqual(self.ln.max_inflight_pays, 1)
+        self.assertEqual(api_endpoint.read_ledger(self.data("ledger")),
+                         (api_endpoint.utc_today(), 3))
+        self.assertGreaterEqual(self.gw.max_inflight_total, 2, "never concurrent")
+        self.assertEqual(self.gw.max_inflight_fp, 1)
+        n = len(self.gw.challenges)
+        self.assertEqual(n, 8, "the first window was not exactly the eight debts")
+        time.sleep(0.3)
+        self.assertEqual(len(self.gw.challenges), n,
+                         "submissions were issued while the breaker held")
+        self.assertEqual(self.debts_on_disk(), sorted(fps), "a debt was dropped")
+        self.assertEqual(os.listdir(self.data("proofs")), [])
+        # Oldest first, one reservation each for the three that were tried.
+        order = [inv.split(":")[2] for inv in self.ln.pay_calls]
+        self.assertEqual(order, fps[:3])
 
 
 if __name__ == "__main__":

@@ -53,6 +53,7 @@ Precedence: invocation env > `.env` beside the script > defaults.
 | `L402_EXPIRY_SECS` | 3600 | age past which an unpaid in-flight challenge is abandoned and re-challenged, loudly |
 | `CIRCUIT_BREAKER_FAILURES` | 5 | consecutive payment failures before purchasing pauses |
 | `CIRCUIT_BREAKER_PAUSE_SECS` | 60 | initial pause; doubles per failed probe, capped at 3600 |
+| `INFLIGHT` | 1 | gateway submissions the buyer may hold in the air at once (strict positive int); 1 = the serial pass |
 
 ## Money rules
 
@@ -69,6 +70,54 @@ Precedence: invocation env > `.env` beside the script > defaults.
 - The phoenixd password lives only in memory and an Authorization header —
   no subprocesses, so never in argv; never logged.
 
+## Concurrency: `INFLIGHT`
+
+At the default, `INFLIGHT=1`, the buyer runs the serial pass unchanged:
+one debt at a time, oldest first, each to completion. With `INFLIGHT=n`
+(n > 1) a pass may hold up to n `/timestamp` submissions in the air at
+once — only submissions. The worker threads do nothing but the HTTP call;
+every answer is handled on the buyer thread, so proof writes, `clear_debt`,
+the ledger, the log and the breaker are touched by one thread exactly as
+at 1. A free-door answer (200 + proof) completes as today: atomic proof
+write, debt cleared, `proof_free`. The first sign of the paid door — a 402,
+or a sidecar already on disk — ends the concurrent phase: the answers
+already in flight are collected, then that debt and every remaining debt
+go one at a time through the same paid machinery as at 1 (budget preflight,
+decode, ceilings, reserve, sidecar, pay, redeem, breaker). A collected 402
+is not re-challenged; it is paid against a fresh ledger read. Payments are
+never concurrent. A pass that has seen a 402 stays serial to its end; the
+next pass starts concurrent again. A fingerprint is in flight at most once:
+a pass drains before it returns. Retry-After and the breaker gate every
+new submission as they gate every serial debt; a stop (429, 503, gateway
+unreachable, ledger unreadable) lets the answers already in flight land,
+then ends the pass, and any debt whose answer was lost or deferred is
+owed again next pass. A failure in flight leaves its debt in place;
+there is no new retry logic.
+
+Proven at `INFLIGHT=8` against a stub free gateway that measures how many
+submissions it holds per fingerprint and in total (each test also checks
+the overlap really happened): SIGKILL mid-flight then restart converges to
+exactly one proof per acknowledged record with no debt lost and a
+proof-written-debt-uncleared straggler absorbed by `already_bought` without
+another submission (`test_inflight_sigkill_mid_flight_converges_one_proof_each`);
+no fingerprint is ever in flight twice at once — within a pass, across
+passes after a transient 500, or under a duplicate POST
+(`test_inflight_fingerprint_in_flight_at_most_once`); a door that flips
+from proofs to 402 mid-pass sends the pass serial with one challenge, one
+invoice, one reservation, one payment and one redeem per paid debt,
+payments never overlapping, oldest first
+(`test_inflight_door_flips_to_paid_mid_pass_goes_serial`); 429 stops new
+submissions until Retry-After elapses and buying then resumes
+(`test_inflight_429_stops_new_submissions`); the breaker trips on the
+third refused payment and freezes submissions
+(`test_inflight_breaker_trips_and_stops_submissions`); the knob is a strict
+positive integer defaulting to 1
+(`test_inflight_knob_strict_positive_int_default_one`). `INFLIGHT=24` has
+run against a live gateway and sustained about 20 free proofs per second
+where the serial path sustains 1. **Unproven: `INFLIGHT` > 1 against a
+live phoenixd, and gateway-side rate limiting under a real burst — the
+stub never throttles unless told to.**
+
 ## Debt lifecycle
 
 owed (`debts/<fp>`) → in-flight (`debts/<fp>.l402`: challenged, then paid)
@@ -84,7 +133,7 @@ across a death; there is no shutdown sequence.
 LISTEN_ADDR=127.0.0.1:8402 GATEWAY_URL=http://... python3 api_endpoint.py
 ```
 
-The suite (20 tests, no network, no phoenixd):
+The suite (26 tests, no network, no phoenixd):
 
 ```bash
 python3 -m unittest test_api_endpoint -v
@@ -116,11 +165,12 @@ creates a fresh `log`:
 
 ## Claims, labelled
 
-Proven by the 20-test suite and the live smoke: the door contract
+Proven by the 26-test suite and the live smoke: the door contract
 (including 411/400/405 refusals and the durable-debt-before-received
 ordering), the budget/breaker/ledger rules, anchored-vs-pending detection
-against real fixture proofs, and one live pending purchase within the
-ceiling. The four crash/money invariants, by test name:
+against real fixture proofs, the `INFLIGHT` pins listed above, and one
+live pending purchase within the ceiling. The four crash/money invariants,
+by test name:
 `test_sigkill_mid_burst_every_acked_record_bought`,
 `test_kill_inside_pay_to_redeem_window_exactly_one_payment`,
 `test_corrupt_ledger_pauses_purchases_never_intake`,

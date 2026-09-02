@@ -13,6 +13,8 @@ money rules: README.md.
 
 import base64
 import http.client
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 import json
 import os
 import re
@@ -134,6 +136,12 @@ def resolve_config(environ, script_dir=SCRIPT_DIR):
             raise ConfigError(f"{key} must be a positive number of seconds, got {raw!r}")
         return v
 
+    def pint(key, default):
+        raw = get(key, default)
+        if not re.fullmatch(r"[0-9]+", str(raw)) or int(raw) < 1:
+            raise ConfigError(f"{key} must be a positive integer, got {raw!r}")
+        return int(raw)
+
     data_dir = get("DATA_DIR", script_dir)
     return {
         "listen_host": host,
@@ -150,6 +158,7 @@ def resolve_config(environ, script_dir=SCRIPT_DIR):
         "l402_expiry_secs": secs("L402_EXPIRY_SECS", "3600"),
         "breaker_failures": uint("CIRCUIT_BREAKER_FAILURES", "5"),
         "breaker_pause_secs": secs("CIRCUIT_BREAKER_PAUSE_SECS", "60"),
+        "inflight": pint("INFLIGHT", "1"),
         "data_dir": data_dir,
         "debts_dir": os.path.join(data_dir, "debts"),
         "proofs_dir": os.path.join(data_dir, "proofs"),
@@ -630,31 +639,19 @@ def finish_sidecar(cfg, password, fp, sc, age, flags):
     return True
 
 
-def buy_one(cfg, password, fp, flags):
-    """Work one debt to its next durable state. True = keep working this
-    pass; False = stop the pass (gateway or payer down, rate-limited, the
-    ledger unreadable, or the breaker tripped). Every skip leaves the debt
-    in place — never dropped."""
-    if os.path.exists(proof_path(cfg, fp)):
-        # One record, one payment, one proof: a re-POSTed or already-bought
-        # fingerprint costs nothing.
-        clear_debt(cfg, fp)
-        log_event(cfg, "already_bought", fp=fp)
-        return True
-
-    sc, age = load_sidecar(sidecar_path(cfg, fp))
-    if sc is not None:
-        return finish_sidecar(cfg, password, fp, sc, age, flags)
-
-    # Budget preflight before any gateway contact: a corrupt ledger pauses
-    # every purchase (and challenge), never intake.
+def _budget_preflight(cfg, flags):
+    """Budget preflight before any gateway contact: a corrupt ledger pauses
+    every purchase (and challenge), never intake. Returns one of
+    ("stop", None, None)  — the ledger is unreadable: the pass ends;
+    ("skip", day, spent)  — today's budget is spent: the debt is kept;
+    ("ok", day, spent)    — proceed to the gateway."""
     try:
         day, spent = read_ledger(cfg["ledger_path"])
     except LedgerCorrupt:
         changed, _ = flags["ledger"].transition("paused")
         if changed:
             log_event(cfg, "purchases_paused", reason="ledger_unreadable")
-        return False
+        return "stop", None, None
     changed, prev = flags["ledger"].transition("ok")
     if changed and prev == "paused":
         log_event(cfg, "purchases_resumed")
@@ -671,18 +668,49 @@ def buy_one(cfg, password, fp, flags):
         if changed:
             log_event(cfg, "budget_exhausted", remaining=remaining,
                       budget=cfg["daily_budget_sats"])
-        return True
+        return "skip", day, spent
     changed, prev = flags["budget"].transition("ok")
     if changed and prev == "exhausted":
         log_event(cfg, "budget_resumed", remaining=remaining,
                   budget=cfg["daily_budget_sats"])
+    return "ok", day, spent
+
+
+def buy_one(cfg, password, fp, flags):
+    """Work one debt to its next durable state. True = keep working this
+    pass; False = stop the pass (gateway or payer down, rate-limited, the
+    ledger unreadable, or the breaker tripped). Every skip leaves the debt
+    in place — never dropped."""
+    if os.path.exists(proof_path(cfg, fp)):
+        # One record, one payment, one proof: a re-POSTed or already-bought
+        # fingerprint costs nothing.
+        clear_debt(cfg, fp)
+        log_event(cfg, "already_bought", fp=fp)
+        return True
+
+    sc, age = load_sidecar(sidecar_path(cfg, fp))
+    if sc is not None:
+        return finish_sidecar(cfg, password, fp, sc, age, flags)
+
+    verdict, day, spent = _budget_preflight(cfg, flags)
+    if verdict != "ok":
+        return verdict == "skip"  # "stop" ends the pass; "skip" keeps the debt
 
     try:
         status, headers, body = gateway_challenge(cfg, fp)
     except Unreachable:
         return _mark_down(cfg, flags, "gateway")
     _mark_up(cfg, flags, "gateway")
+    return _buy_challenged(cfg, password, fp, status, headers, body,
+                           day, spent, flags)
 
+
+def _buy_challenged(cfg, password, fp, status, headers, body, day, spent, flags):
+    """The gateway has answered a challenge for fp: the free door hands the
+    proof over, 429 rate-limits the pass, 402 enters the paid machinery
+    (decode, ceilings, reserve, sidecar, pay, redeem). day/spent are the
+    ledger as read by the preflight that preceded THIS call — nothing may
+    have reserved against the ledger in between."""
     if status == 200 and looks_like_ots(body):
         # The gateway handed the proof over without charging: its free door
         # (L402_ENABLED=false).
@@ -743,6 +771,8 @@ def buy_one(cfg, password, fp, flags):
 
 
 def buyer_pass(cfg, password, flags):
+    if cfg["inflight"] > 1:
+        return _buyer_pass_inflight(cfg, password, flags)
     br = flags["breaker"]
     for fp in list_debts_oldest_first(cfg):
         if time.time() < flags["retry_at"][0]:
@@ -750,6 +780,107 @@ def buyer_pass(cfg, password, flags):
         if br["open"] and time.time() < br["until"]:
             return  # breaker open: purchase nothing until the pause elapses
         if not buy_one(cfg, password, fp, flags):
+            return
+
+
+def _buyer_pass_inflight(cfg, password, flags):
+    """INFLIGHT > 1. Up to cfg["inflight"] gateway_challenge submissions
+    ride in flight at once, oldest debts first. The worker threads do only
+    the HTTP call; every response is handled here on the buyer thread, so
+    the files, the ledger, the log and the flags are touched by one thread
+    exactly as at INFLIGHT=1. A free-door answer (200 + ots) completes as
+    today. The first sign of the paid door — a 402, or a sidecar already on
+    disk — ends the concurrent phase: the outstanding answers are collected,
+    then that debt and every remaining debt go one at a time through the
+    same paid machinery buy_one uses. Payments are never concurrent. A
+    fingerprint is in flight at most once because a pass drains before it
+    returns and the next pass lists the debts afresh. Retry-After and the
+    breaker gate every new submission just as they gate every serial debt;
+    a stop (429, 503, gateway unreachable, ledger unreadable) still lets the
+    answers already in flight land, then ends the pass — any 402 among them
+    is simply owed again next pass, unpaid and unreserved."""
+    br = flags["breaker"]
+    n = cfg["inflight"]
+    queue = list_debts_oldest_first(cfg)
+    pos = {fp: i for i, fp in enumerate(queue)}
+    idx = 0            # next debt not yet taken from the queue
+    outstanding = {}   # future -> (fp, day, spent as read before submitting)
+    deferred = {}      # fp -> (status, headers, body): 402s for the serial phase
+    stop = False       # buy_one's False: the pass ends once the air is clear
+    go_serial = False  # the paid door showed itself: serial from here on
+
+    def gated():
+        if time.time() < flags["retry_at"][0]:
+            return True  # honoring the gateway's Retry-After
+        if br["open"] and time.time() < br["until"]:
+            return True  # breaker open: purchase nothing until the pause elapses
+        return False
+
+    with ThreadPoolExecutor(max_workers=n, thread_name_prefix="inflight") as pool:
+        while True:
+            while (not stop and not go_serial and idx < len(queue)
+                   and len(outstanding) < n):
+                if gated():
+                    stop = True
+                    break
+                fp = queue[idx]
+                idx += 1
+                if os.path.exists(proof_path(cfg, fp)):
+                    buy_one(cfg, password, fp, flags)  # already_bought: no contact
+                    continue
+                if load_sidecar(sidecar_path(cfg, fp))[0] is not None:
+                    idx -= 1  # an in-flight purchase: the paid machinery's, serially
+                    go_serial = True
+                    break
+                verdict, day, spent = _budget_preflight(cfg, flags)
+                if verdict == "stop":
+                    stop = True
+                    break
+                if verdict == "skip":
+                    continue
+                outstanding[pool.submit(gateway_challenge, cfg, fp)] = (fp, day, spent)
+            if not outstanding:
+                break
+            done, _ = wait_futures(outstanding, return_when=FIRST_COMPLETED)
+            for fut in done:
+                fp, day, spent = outstanding.pop(fut)
+                exc = fut.exception()
+                if exc is not None:
+                    if isinstance(exc, Unreachable):
+                        _mark_down(cfg, flags, "gateway")
+                        stop = True
+                        continue
+                    raise exc
+                _mark_up(cfg, flags, "gateway")
+                status, headers, body = fut.result()
+                if status == 402:
+                    deferred[fp] = (status, headers, body)
+                    go_serial = True
+                    continue
+                if not _buy_challenged(cfg, password, fp, status, headers, body,
+                                       day, spent, flags):
+                    stop = True
+    if stop or not go_serial:
+        return
+    # Serial phase: the 402s already answered, oldest first, then every debt
+    # still untouched, each one to completion before the next begins. A
+    # collected 402 re-reads the ledger first: the reservation just made for
+    # the debt before it must count.
+    for fp in sorted(deferred, key=pos.get) + queue[idx:]:
+        if gated():
+            return
+        if fp in deferred:
+            status, headers, body = deferred[fp]
+            verdict, day, spent = _budget_preflight(cfg, flags)
+            if verdict == "stop":
+                return
+            if verdict == "skip":
+                continue
+            ok = _buy_challenged(cfg, password, fp, status, headers, body,
+                                 day, spent, flags)
+        else:
+            ok = buy_one(cfg, password, fp, flags)
+        if not ok:
             return
 
 
@@ -1013,7 +1144,8 @@ def main():
               poll_secs=cfg["poll_secs"],
               upgrade_secs=cfg["upgrade_secs"],
               debts=len(list_debts_oldest_first(cfg)),
-              proofs=len(list_proofs(cfg)))
+              proofs=len(list_proofs(cfg)),
+              **({"inflight": cfg["inflight"]} if cfg["inflight"] > 1 else {}))
 
     hb = {}
     threading.Thread(target=server.serve_forever, name="door",
