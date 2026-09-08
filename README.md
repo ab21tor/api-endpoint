@@ -54,6 +54,7 @@ Precedence: invocation env > `.env` beside the script > defaults.
 | `CIRCUIT_BREAKER_FAILURES` | 5 | consecutive payment failures before purchasing pauses |
 | `CIRCUIT_BREAKER_PAUSE_SECS` | 60 | initial pause; doubles per failed probe, capped at 3600 |
 | `INFLIGHT` | 1 | gateway submissions the buyer may hold in the air at once (strict positive int); 1 = the serial pass |
+| `LOG_CAP_BYTES` | 16777216 | once `log` reaches this many bytes the next event renames it to `log.1` (replacing any previous `.1`) and starts fresh; 0 = never rotate |
 
 ## Money rules
 
@@ -146,26 +147,21 @@ anchoring arrives later via the upgrader.
 
 ## Log rotation
 
-The `log` file is append-only and unbounded by design — roughly a few
-hundred bytes per record across its lifecycle events, which is gigabytes
-per year at sustained volume. Nothing in the daemon reads it back, and
-`log_event` opens-appends-closes per line, so plain rename-based logrotate
-is safe with no signal, no copytruncate, and no restart — the next event
-creates a fresh `log`:
-
-```
-/path/to/data-dir/log {
-    monthly
-    rotate 12
-    compress
-    missingok
-    notifempty
-}
-```
+The `log` file is append-only, roughly a few hundred bytes per record
+across its lifecycle events (about 34 MB a day at the live demo's volume).
+It rotates itself: once it reaches `LOG_CAP_BYTES` (16 MiB by default) the
+next event renames it to `log.1`, replacing any previous `.1`, and starts a
+fresh `log`, so at most two generations exist on disk. This is the same
+cap-and-rename shape the demo feeder uses for its manifest. The check runs
+under the log lock on the single writer path, and `log_event` still
+opens-appends-closes per line, so an external rename-based logrotate
+remains safe if longer retention is wanted; set `LOG_CAP_BYTES=0` to hand
+rotation to it entirely. Proven by `test_log_rotates_to_dot1_at_cap_and_replaces_previous`,
+`test_log_cap_zero_never_rotates` and `test_log_cap_knob_default_and_validation`.
 
 ## Claims, labelled
 
-Proven by the 26-test suite and the live smoke: the door contract
+Proven by the 29-test suite and the live smoke: the door contract
 (including 411/400/405 refusals and the durable-debt-before-received
 ordering), the budget/breaker/ledger rules, anchored-vs-pending detection
 against real fixture proofs, the `INFLIGHT` pins listed above, and one

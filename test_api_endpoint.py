@@ -1309,3 +1309,56 @@ class TestInflight(IntegrationBase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# LOG_CAP_BYTES: the data log rotates to log.1 once it reaches the cap
+class TestLogRotation(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="log-rotate-")
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.base = {"LISTEN_ADDR": "127.0.0.1:8402", "GATEWAY_URL": "http://x"}
+
+    def cfg(self, cap):
+        return api_endpoint.resolve_config(dict(self.base, LOG_CAP_BYTES=cap), script_dir=self.d)
+
+    def lines(self, name):
+        try:
+            with open(os.path.join(self.d, name)) as f:
+                return f.read().splitlines()
+        except FileNotFoundError:
+            return None
+
+    def test_log_rotates_to_dot1_at_cap_and_replaces_previous(self):
+        cfg = self.cfg("300")
+        n = 0
+        while self.lines("log.1") is None:
+            n += 1
+            api_endpoint.log_event(cfg, "ev", n=n)
+            self.assertLess(n, 100, "no rotation within 100 lines at a 300-byte cap")
+        first_gen = self.lines("log.1")
+        self.assertGreaterEqual(sum(len(l) + 1 for l in first_gen), 300)
+        self.assertEqual([int(l.split("n=")[1]) for l in first_gen + self.lines("log")], list(range(1, n + 1)))
+        while self.lines("log.1") == first_gen:
+            n += 1
+            api_endpoint.log_event(cfg, "ev", n=n)
+            self.assertLess(n, 200)
+        second_gen = self.lines("log.1")
+        self.assertEqual(int(second_gen[0].split("n=")[1]), len(first_gen) + 1)
+        self.assertEqual([int(l.split("n=")[1]) for l in second_gen + self.lines("log")],
+                         list(range(len(first_gen) + 1, n + 1)))
+
+    def test_log_cap_zero_never_rotates(self):
+        cfg = self.cfg("0")
+        for n in range(200):
+            api_endpoint.log_event(cfg, "ev", n=n, pad="x" * 60)
+        self.assertIsNone(self.lines("log.1"))
+        self.assertEqual(len(self.lines("log")), 200)
+
+    def test_log_cap_knob_default_and_validation(self):
+        d = self.d
+        self.assertEqual(api_endpoint.resolve_config(self.base, script_dir=d)["log_cap_bytes"], 16 * 1024 * 1024)
+        self.assertEqual(self.cfg("")["log_cap_bytes"], 16 * 1024 * 1024)
+        for bad in ("-1", "1.5", "big", "+2"):
+            with self.assertRaises(api_endpoint.ConfigError, msg=repr(bad)) as cm:
+                self.cfg(bad)
+            self.assertIn("LOG_CAP_BYTES", str(cm.exception))

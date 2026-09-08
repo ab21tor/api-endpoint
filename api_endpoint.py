@@ -159,6 +159,7 @@ def resolve_config(environ, script_dir=SCRIPT_DIR):
         "breaker_failures": uint("CIRCUIT_BREAKER_FAILURES", "5"),
         "breaker_pause_secs": secs("CIRCUIT_BREAKER_PAUSE_SECS", "60"),
         "inflight": pint("INFLIGHT", "1"),
+        "log_cap_bytes": uint("LOG_CAP_BYTES", str(16 * 1024 * 1024)),
         "data_dir": data_dir,
         "debts_dir": os.path.join(data_dir, "debts"),
         "proofs_dir": os.path.join(data_dir, "proofs"),
@@ -192,10 +193,21 @@ _LOG_LOCK = threading.Lock()
 
 def log_event(cfg, event, **kv):
     """One fixed-format line: '<utc> <event> k=v ...'. Never record bytes,
-    never secrets, never gateway or phoenixd URLs."""
+    never secrets, never gateway or phoenixd URLs.
+
+    Rotation: once the log has reached LOG_CAP_BYTES, the next event renames
+    it to `log.1` (replacing any previous `.1`) and starts a fresh `log`; one
+    generation is kept. 0 disables rotation."""
     parts = [utc_now_iso(), event] + [f"{k}={v}" for k, v in kv.items()]
     with _LOG_LOCK:
         try:
+            cap = cfg.get("log_cap_bytes", 0)
+            if cap:
+                try:
+                    if os.path.getsize(cfg["log_path"]) >= cap:
+                        os.replace(cfg["log_path"], cfg["log_path"] + ".1")
+                except FileNotFoundError:
+                    pass
             with open(cfg["log_path"], "a", encoding="utf-8") as f:
                 f.write(" ".join(parts) + "\n")
         except OSError:
