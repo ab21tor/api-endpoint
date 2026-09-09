@@ -48,16 +48,22 @@ PENDING_REAL = os.path.join(_FIXTURES, "pending.ots")    # real pending proof, s
 TEST_PW = "testpw"
 EXPECTED_AUTH = "Basic " + base64.b64encode(b":" + TEST_PW.encode()).decode()
 CAL_TAG = b"\x00" + bytes.fromhex("83dfe30d2ef90c8e")
+OTHER_DIGEST = hashlib.sha256(b"someone else's record").hexdigest()
+
+
+# The detached-proof header the ots client writes: magic, version 1, the
+# sha256 file-hash op (0x08), then the 32-byte digest — proof_digest reads it.
+OTS_HEAD = api_endpoint.OTS_MAGIC + b"\x01\x08"
 
 
 def pending_ots(fp):
-    b = api_endpoint.OTS_MAGIC + bytes.fromhex(fp) + CAL_TAG + b"fake-calendar"
+    b = OTS_HEAD + bytes.fromhex(fp) + CAL_TAG + b"fake-calendar"
     assert api_endpoint.BITCOIN_ATTESTATION not in b
     return b
 
 
 def anchored_ots(fp):
-    return (api_endpoint.OTS_MAGIC + bytes.fromhex(fp)
+    return (OTS_HEAD + bytes.fromhex(fp)
             + api_endpoint.BITCOIN_ATTESTATION + b"\x01\x02")
 
 
@@ -179,6 +185,17 @@ class FakeGateway:
         self.counter = 0
         self.anchor_now = set()
         self.stall_redeem = {}  # fp -> {"event", "secs", "used"}
+        # /upgrade throttle, the real gateway's shape: after upgrade_limit
+        # anonymous upgrades the answer is 429 + Retry-After, unless the
+        # request carries "Bearer <upgrade_token>" (the D4 exemption).
+        self.upgrade_limit = None
+        self.upgrade_token = None
+        self.upgrade_auth_seen = []
+        # A buggy or hostile gateway: every proof it hands back (free door,
+        # redeem, upgrade) is a well-formed proof of SOMEONE ELSE's digest.
+        self.wrong_digest = False
+        # When set, every redeem answers this status with an empty body.
+        self.redeem_status_override = None
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -217,7 +234,7 @@ class FakeGateway:
                         outer._challenge(self, digest)
                     return
                 if self.path == "/upgrade":
-                    outer._upgrade(self, digest, body)
+                    outer._upgrade(self, digest, body, self.headers.get("Authorization"))
                     return
                 self._json(404, {"detail": "nope"})
 
@@ -243,6 +260,9 @@ class FakeGateway:
                  f'L402 macaroon="{token}", invoice="{invoice}"'})
 
     def _redeem(self, h, digest, auth):
+        if self.redeem_status_override is not None:
+            h._json(self.redeem_status_override, {"detail": "not now"})
+            return
         token, _, preimage = auth[len("L402 "):].partition(":")
         with self.lock:
             entry = self.minted.get(token)
@@ -265,9 +285,14 @@ class FakeGateway:
             time.sleep(self.redeem_delay)
         with self.lock:
             self.redeems.append(fp)
-        h._raw(200, pending_ots(fp), {"Content-Type": "application/octet-stream"})
+        if self.redeem_status_override is not None:
+            # Set while this redeem stalled (the J9 tests): refuse now.
+            h._json(self.redeem_status_override, {"detail": "not now"})
+            return
+        h._raw(200, pending_ots(OTHER_DIGEST if self.wrong_digest else fp),
+               {"Content-Type": "application/octet-stream"})
 
-    def _upgrade(self, h, digest, body):
+    def _upgrade(self, h, digest, body, auth=None):
         try:
             ots = base64.b64decode(body.get("ots") or "", validate=True)
         except ValueError:
@@ -275,10 +300,17 @@ class FakeGateway:
                           "ots": None})
             return
         with self.lock:
+            self.upgrade_auth_seen.append(auth)
+            exempt = self.upgrade_token is not None and auth == f"Bearer {self.upgrade_token}"
+            anonymous = sum(1 for a in self.upgrade_auth_seen
+                            if not (self.upgrade_token is not None and a == f"Bearer {self.upgrade_token}"))
+            if self.upgrade_limit is not None and not exempt and anonymous > self.upgrade_limit:
+                h._json(429, {"detail": "slow down"}, {"Retry-After": "1"})
+                return
             self.upgrade_calls.append(digest)
             anchor = digest in self.anchor_now
         if anchor:
-            nb = anchored_ots(digest)
+            nb = anchored_ots(OTHER_DIGEST if self.wrong_digest else digest)
             h._json(200, {"status": "anchored", "bitcoin_anchored": True,
                           "ots": base64.b64encode(nb).decode()})
         else:
@@ -350,7 +382,7 @@ class FreeDoorGateway(FakeGateway):
             if mode == "paid":
                 super()._challenge(h, digest)  # records the challenge itself
             elif mode == "free":
-                h._raw(200, pending_ots(digest),
+                h._raw(200, pending_ots(OTHER_DIGEST if self.wrong_digest else digest),
                        {"Content-Type": "application/octet-stream"})
             elif mode == "limited":
                 h._json(429, {"detail": "slow down"},
@@ -927,6 +959,80 @@ class TestCorruptLedger(IntegrationBase):
         self.assertIn("purchases_resumed", self.read_service_log())
 
 
+# D5 (2026-09-08): a proof is only ever stored if it is a proof OF the
+# fingerprint this box asked about. The review's E-A1 shape: a gateway that
+# answers with a well-formed proof of somebody else's digest.
+class TestWrongDigestRefused(IntegrationBase):
+    def test_proof_digest_reads_the_real_fixtures(self):
+        with open(ANCHORED_REAL, "rb") as f:
+            anchored = f.read()
+        with open(PENDING_REAL, "rb") as f:
+            pending = f.read()
+        self.assertEqual(api_endpoint.proof_digest(anchored),
+                         "e7783786ddd776a96d7dbc2fcc628b38c0e9fd758fb5c9be08d162a1a79c96e5")
+        self.assertEqual(len(api_endpoint.proof_digest(pending) or ""), 64)
+        self.assertIsNone(api_endpoint.proof_digest(api_endpoint.OTS_MAGIC + b"\x01\x08short"))
+        self.assertIsNone(api_endpoint.proof_digest(b"not a proof at all"))
+
+    def test_free_door_wrong_digest_refused_then_bought(self):
+        self.gw.shutdown()
+        self.gw = FreeDoorGateway()
+        self.gw.wrong_digest = True
+        r = self.start_service()
+        body = b"my record, somebody else's proof"
+        fp = hashlib.sha256(body).hexdigest()
+        self.assertEqual(post_record(r, body)[0], 200)
+        self.wait_until(lambda: "proof_wrong_digest fp=" + fp in self.read_service_log(),
+                        what="refusal logged")
+        time.sleep(0.3)
+        self.assertFalse(os.path.exists(self.proof_file(fp)), "a proof of another digest was stored")
+        self.assertTrue(os.path.exists(self.debt_file(fp)), "the debt was dropped")
+        self.assertNotIn(fp, os.listdir(self.data("pending")))
+        # The gateway recovers: the next answer is a proof of fp and is stored.
+        self.gw.wrong_digest = False
+        self.wait_until(lambda: os.path.exists(self.proof_file(fp)), what="proof after recovery")
+        with open(self.proof_file(fp), "rb") as f:
+            self.assertEqual(api_endpoint.proof_digest(f.read()), fp)
+        self.assertFalse(os.path.exists(self.debt_file(fp)))
+
+    def test_paid_redeem_wrong_digest_refused(self):
+        self.gw.wrong_digest = True
+        r = self.start_service()
+        body = b"paid for, wrong proof back"
+        fp = hashlib.sha256(body).hexdigest()
+        self.assertEqual(post_record(r, body)[0], 200)
+        self.wait_until(lambda: "proof_wrong_digest fp=" + fp in self.read_service_log(),
+                        what="refusal logged")
+        time.sleep(0.3)
+        self.assertFalse(os.path.exists(self.proof_file(fp)))
+        # Paid once; the sidecar keeps the preimage for the retry (redeem-only, never pay again).
+        self.assertEqual(len(self.ln.pays_for_fp(fp)), 1)
+        with open(self.sidecar_file(fp)) as f:
+            self.assertIn("preimage", json.load(f))
+        self.gw.wrong_digest = False
+        self.wait_until(lambda: os.path.exists(self.proof_file(fp)), what="proof after recovery")
+        self.assertEqual(len(self.ln.pays_for_fp(fp)), 1)
+
+    def test_upgrade_wrong_digest_refused_keeps_pending(self):
+        r = self.start_service(UPGRADE_SECS="0.2")
+        body = b"to be upgraded wrongly"
+        fp = hashlib.sha256(body).hexdigest()
+        self.assertEqual(post_record(r, body)[0], 200)
+        self.wait_until(lambda: os.path.exists(self.proof_file(fp)), what="proof")
+        self.gw.wrong_digest = True
+        self.gw.anchor_now.add(fp)
+        self.wait_until(lambda: "proof_wrong_digest fp=" + fp in self.read_service_log(),
+                        what="refusal logged")
+        with open(self.proof_file(fp), "rb") as f:
+            self.assertEqual(f.read(), pending_ots(fp))   # untouched
+        self.assertIn(fp, os.listdir(self.data("pending")))
+        self.gw.wrong_digest = False
+        self.wait_until(lambda: api_endpoint.is_anchored(open(self.proof_file(fp), "rb").read()),
+                        what="anchored after recovery")
+        with open(self.proof_file(fp), "rb") as f:
+            self.assertEqual(api_endpoint.proof_digest(f.read()), fp)
+
+
 # integration: upgrader
 class TestUpgrader(IntegrationBase):
     def test_upgrade_replaces_only_on_anchored_and_then_stops(self):
@@ -1044,6 +1150,186 @@ class TestKillPayRedeemWindow(IntegrationBase):
         self.assertFalse(os.path.exists(self.debt_file(fp)))
         self.assertFalse(os.path.exists(self.sidecar_file(fp)))
         self.assertIn("bought fp=" + fp, self.read_service_log())
+
+
+class TestRedeemCeiling(IntegrationBase):
+    """J9 (2026-09-08): a paid preimage the gateway keeps refusing (an L402
+    secret rotation makes every stored macaroon a 401) is retried every pass
+    up to REDEEM_ATTEMPTS_MAX times, then marked needs-attention in its
+    sidecar and the heartbeat, logged once, and retried once per
+    REDEEM_ATTENTION_RETRY_SECS. Never dropped, never re-paid."""
+
+    def _paid_then_refused(self, **over):
+        r = self.start_service(REDEEM_ATTEMPTS_MAX=3, **over)
+        body = b"paid, then the gateway forgets the token"
+        fp = hashlib.sha256(body).hexdigest()
+        ev = self.gw.stall_next_redeem(fp, secs=3.0)
+        self.assertEqual(post_record(r, body)[0], 200)
+        self.assertTrue(ev.wait(20), "redeem never started")
+        # The rotation: from here every redeem of the stored token is a 401.
+        self.gw.redeem_status_override = 401
+        return r, fp
+
+    def test_ceiling_marks_attention_once_and_keeps_the_preimage(self):
+        r, fp = self._paid_then_refused()
+        self.wait_until(lambda: "redeem_needs_attention fp=" + fp in self.read_service_log(),
+                        timeout=30, what="needs-attention event")
+        time.sleep(0.5)   # a few more passes: nothing else may be logged for it
+        log = self.read_service_log()
+        self.assertEqual(log.count("redeem_needs_attention fp=" + fp), 1)
+        self.assertLessEqual(log.count("redeem_failed fp=" + fp), 3)
+        with open(self.sidecar_file(fp)) as f:
+            sc = json.load(f)
+        self.assertIn("preimage", sc)
+        self.assertEqual(sc["attempts"], 3)
+        self.assertIn("attention", sc)
+        self.assertTrue(os.path.exists(self.debt_file(fp)), "the debt stays owed")
+        self.assertEqual(len(self.ln.pays_for_fp(fp)), 1, "never re-paid")
+        self.assertEqual(self.gw.challenges_for(fp), 1, "never re-challenged")
+        self.wait_until(lambda: "attention=1" in open(self.data("heartbeat")).read(),
+                        timeout=10, what="heartbeat attention count")
+
+    def test_at_the_ceiling_the_retry_is_slow_and_a_fixed_gateway_heals_it(self):
+        r, fp = self._paid_then_refused(REDEEM_ATTENTION_RETRY_SECS=1)
+        self.wait_until(lambda: "redeem_needs_attention fp=" + fp in self.read_service_log(),
+                        timeout=30, what="needs-attention event")
+        redeems_at_mark = len(self.gw.redeems)
+        time.sleep(0.6)
+        # Retried once per second now, not every 50 ms pass: at most one more.
+        self.assertLessEqual(len([x for x in self.gw.redeems if x == fp]) - redeems_at_mark, 1)
+        # The gateway accepts the token again (the rotation is reverted):
+        # the next slow retry redeems, the proof lands, attention clears.
+        self.gw.redeem_status_override = None
+        self.wait_until(lambda: os.path.exists(self.proof_file(fp)), timeout=30,
+                        what="proof after the gateway recovered")
+        self.assertFalse(os.path.exists(self.sidecar_file(fp)))
+        self.assertEqual(len(self.ln.pays_for_fp(fp)), 1)
+        self.wait_until(lambda: "attention=0" in open(self.data("heartbeat")).read(),
+                        timeout=10, what="heartbeat attention cleared")
+
+    def test_503_counts_nothing(self):
+        r = self.start_service(REDEEM_ATTEMPTS_MAX=2)
+        body = b"gateway says not now"
+        fp = hashlib.sha256(body).hexdigest()
+        self.gw.redeem_status_override = 503
+        self.assertEqual(post_record(r, body)[0], 200)
+        self.wait_until(lambda: self.read_service_log().count("redeem_failed fp=" + fp) >= 3,
+                        timeout=30, what="several 503 refusals")
+        self.assertNotIn("redeem_needs_attention", self.read_service_log())
+        with open(self.sidecar_file(fp)) as f:
+            self.assertNotIn("attempts", json.load(f))
+
+
+# D4 (2026-09-08): the client's proofs must finish. The upgrader works from an
+# on-disk pending index (DATA_DIR/pending/<fp>, a marker written before the
+# proof and removed once the proof is anchored) instead of re-reading every
+# proof file each pass, presents GATEWAY_UPGRADE_TOKEN so the gateway lifts
+# its per-peer /upgrade throttle, and keeps UPGRADE_INFLIGHT calls in the air.
+class TestUpgradeBacklog(IntegrationBase):
+    def seed_pending_proofs(self, n, label, anchored=0):
+        os.makedirs(self.data("proofs"), exist_ok=True)
+        fps = []
+        for i in range(n):
+            fp = hashlib.sha256(f"{label} {i}".encode()).hexdigest()
+            api_endpoint.atomic_write(self.proof_file(fp), pending_ots(fp))
+            fps.append(fp)
+        done = []
+        for i in range(anchored):
+            fp = hashlib.sha256(f"{label} anchored {i}".encode()).hexdigest()
+            api_endpoint.atomic_write(self.proof_file(fp), anchored_ots(fp))
+            done.append(fp)
+        return fps, done
+
+    def pending_index(self):
+        """The markers (fingerprints) in DATA_DIR/pending, None when the
+        directory does not exist yet; the .built flag is not a marker."""
+        try:
+            return sorted(n for n in os.listdir(self.data("pending"))
+                          if api_endpoint.HEX64.fullmatch(n))
+        except OSError:
+            return None
+
+    def test_upgrade_backlog_finishes_with_the_client_token(self):
+        """The review's D4 shape: a gateway that throttles anonymous /upgrade
+        to 5 per pass, 40 pending proofs on disk. With the token every
+        proof is anchored in one pass; the anonymous budget is untouched."""
+        fps, _ = self.seed_pending_proofs(40, "backlog")
+        self.gw.upgrade_limit = 5
+        self.gw.upgrade_token = "upgrade-tok"
+        self.gw.anchor_now.update(fps)
+        self.start_service(UPGRADE_SECS="0.2", GATEWAY_UPGRADE_TOKEN="upgrade-tok",
+                           UPGRADE_INFLIGHT="8")
+        self.wait_until(lambda: all(api_endpoint.is_anchored(open(self.proof_file(fp), "rb").read())
+                                    for fp in fps), timeout=30, what="every pending proof anchored")
+        self.assertEqual(self.pending_index(), [])
+        log = self.read_service_log()
+        self.assertNotIn("upgrade_rate_limited", log)
+        self.assertEqual(log.count(" anchored fp="), 40)
+        self.assertTrue(all(a == "Bearer upgrade-tok" for a in self.gw.upgrade_auth_seen))
+        # Anchored proofs are never polled again: one call per fingerprint.
+        time.sleep(0.6)
+        self.assertEqual(sorted(self.gw.upgrade_calls), sorted(fps))
+
+    def test_upgrade_without_token_is_still_throttled(self):
+        """Control for the pin above: the same backlog without the token
+        converts only what the anonymous budget allows per pass."""
+        fps, _ = self.seed_pending_proofs(40, "throttled")
+        self.gw.upgrade_limit = 5
+        self.gw.upgrade_token = "upgrade-tok"
+        self.gw.anchor_now.update(fps)
+        self.start_service(UPGRADE_SECS="0.3")
+        self.wait_until(lambda: "upgrade_rate_limited" in self.read_service_log(),
+                        what="rate_limited logged")
+        time.sleep(0.5)
+        anchored = sum(api_endpoint.is_anchored(open(self.proof_file(fp), "rb").read()) for fp in fps)
+        self.assertLessEqual(anchored, 5)
+        self.assertGreaterEqual(len(self.pending_index()), 35)
+
+    def test_pending_index_marker_before_proof_and_cleared_on_anchor(self):
+        r = self.start_service(UPGRADE_SECS="0.2")
+        body = b"indexed record"
+        fp = hashlib.sha256(body).hexdigest()
+        self.assertEqual(post_record(r, body)[0], 200)
+        self.wait_until(lambda: os.path.exists(self.proof_file(fp)), what="proof")
+        self.assertIn(fp, self.pending_index())
+        self.gw.anchor_now.add(fp)
+        self.wait_until(lambda: api_endpoint.is_anchored(open(self.proof_file(fp), "rb").read()),
+                        what="anchored on disk")
+        self.wait_until(lambda: fp not in self.pending_index(), what="marker cleared")
+        n = self.gw.upgrades_for(fp)
+        time.sleep(0.6)
+        self.assertEqual(self.gw.upgrades_for(fp), n)
+
+    def test_pending_index_built_once_from_the_proofs_dir(self):
+        """A DATA_DIR from before the index (proofs, no pending/): startup
+        scans the proofs directory once, marks only the pending ones, and
+        never touches the anchored ones."""
+        pending, anchored = self.seed_pending_proofs(3, "migrate", anchored=2)
+        self.assertIsNone(self.pending_index())
+        self.start_service(UPGRADE_SECS="3600")
+        self.wait_until(lambda: "pending_index_built" in self.read_service_log(),
+                        what="index built at startup")
+        self.assertEqual(self.pending_index(), sorted(pending))
+        self.assertIn("pending_index_built pending=3 scanned=5", self.read_service_log())
+        # The same first pass then polls exactly the pending three, once
+        # each; the anchored two are never sent to the gateway.
+        self.wait_until(lambda: len(self.gw.upgrade_calls) >= 3, what="first pass polled the index")
+        time.sleep(0.3)
+        self.assertEqual(sorted(self.gw.upgrade_calls), sorted(pending))
+        self.assertEqual(self.pending_index(), sorted(pending))  # still pending, still indexed
+
+    def test_upgrade_inflight_knob(self):
+        d = tempfile.mkdtemp(prefix="upg-cfg-")
+        self.addCleanup(shutil.rmtree, d, True)
+        base = {"LISTEN_ADDR": "127.0.0.1:8402", "GATEWAY_URL": "http://x"}
+        cfg = api_endpoint.resolve_config(dict(base, INFLIGHT="6"), script_dir=d)
+        self.assertEqual(cfg["upgrade_inflight"], 6)      # defaults to INFLIGHT
+        self.assertEqual(api_endpoint.resolve_config(dict(base, UPGRADE_INFLIGHT="3"), script_dir=d)["upgrade_inflight"], 3)
+        self.assertIsNone(api_endpoint.resolve_config(base, script_dir=d)["gateway_upgrade_token"])
+        self.assertEqual(api_endpoint.resolve_config(dict(base, GATEWAY_UPGRADE_TOKEN="t"), script_dir=d)["gateway_upgrade_token"], "t")
+        for bad in ("0", "-1", "x"):
+            with self.assertRaises(api_endpoint.ConfigError):
+                api_endpoint.resolve_config(dict(base, UPGRADE_INFLIGHT=bad), script_dir=d)
 
 
 # INFLIGHT: several gateway submissions in the air at once

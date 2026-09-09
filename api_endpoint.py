@@ -7,7 +7,7 @@ each fingerprint buys its own OpenTimestamps proof from a Lightning-paid
 L402 timestamp gateway, paid via the payer phoenixd.
 
 One route: POST /record. Everything else is the filesystem under DATA_DIR
-(debts/, proofs/, ledger, heartbeat, log). Config, file semantics, and the
+(debts/, proofs/, pending/, ledger, heartbeat, log). Config, file semantics, and the
 money rules: README.md.
 """
 
@@ -156,13 +156,25 @@ def resolve_config(environ, script_dir=SCRIPT_DIR):
         "upgrade_secs": secs("UPGRADE_SECS", "600"),
         "heartbeat_secs": secs("HEARTBEAT_SECS", "10"),
         "l402_expiry_secs": secs("L402_EXPIRY_SECS", "3600"),
+        # J9 (2026-09-08): a paid-but-unredeemed sidecar is retried every
+        # pass this many times, then marked needs-attention and retried
+        # once per redeem_attention_retry_secs — never dropped, never
+        # re-paid, and no longer one log line per pass forever.
+        "redeem_attempts_max": pint("REDEEM_ATTEMPTS_MAX", "300"),
+        "redeem_attention_retry_secs": secs("REDEEM_ATTENTION_RETRY_SECS", "3600"),
         "breaker_failures": uint("CIRCUIT_BREAKER_FAILURES", "5"),
         "breaker_pause_secs": secs("CIRCUIT_BREAKER_PAUSE_SECS", "60"),
         "inflight": pint("INFLIGHT", "1"),
+        # The upgrader's own window; defaults to INFLIGHT.
+        "upgrade_inflight": pint("UPGRADE_INFLIGHT", get("INFLIGHT", "1") or "1"),
+        # Presented as a bearer on /upgrade so the gateway lifts its per-peer
+        # throttle for this client (its UPGRADE_CLIENT_TOKEN). Unset = anonymous.
+        "gateway_upgrade_token": get("GATEWAY_UPGRADE_TOKEN") or None,
         "log_cap_bytes": uint("LOG_CAP_BYTES", str(16 * 1024 * 1024)),
         "data_dir": data_dir,
         "debts_dir": os.path.join(data_dir, "debts"),
         "proofs_dir": os.path.join(data_dir, "proofs"),
+        "pending_dir": os.path.join(data_dir, "pending"),
         "ledger_path": os.path.join(data_dir, "ledger"),
         "heartbeat_path": os.path.join(data_dir, "heartbeat"),
         "log_path": os.path.join(data_dir, "log"),
@@ -328,6 +340,19 @@ def looks_like_ots(data):
     return data.startswith(OTS_MAGIC)
 
 
+def proof_digest(data):
+    """The digest a detached proof is about (64 hex), or None when the bytes
+    do not carry one: magic, version 1, the sha256 file-hash op (0x08), then
+    the 32-byte digest — the layout the ots client writes. A proof is only
+    ever stored here when this equals the fingerprint that was asked for."""
+    head = len(OTS_MAGIC)
+    if not data.startswith(OTS_MAGIC) or len(data) < head + 2 + 32:
+        return None
+    if data[head] != 0x01 or data[head + 1] != 0x08:
+        return None
+    return data[head + 2:head + 34].hex()
+
+
 def is_anchored(data):
     return BITCOIN_ATTESTATION in data
 
@@ -381,8 +406,11 @@ def gateway_redeem(cfg, fp, macaroon, preimage):
 def gateway_upgrade(cfg, fp, ots_bytes):
     body = json.dumps({"digest": fp,
                        "ots": base64.b64encode(ots_bytes).decode("ascii")})
-    return http_post(cfg["gateway_url"] + "/upgrade", body.encode(),
-                     {"Content-Type": "application/json"}, timeout=60)
+    headers = {"Content-Type": "application/json"}
+    if cfg.get("gateway_upgrade_token"):
+        headers["Authorization"] = "Bearer " + cfg["gateway_upgrade_token"]
+    return http_post(cfg["gateway_url"] + "/upgrade", body.encode(), headers,
+                     timeout=60)
 
 
 def phoenixd_call(cfg, password, endpoint, bolt11, timeout):
@@ -479,6 +507,64 @@ def list_proofs(cfg):
     return out
 
 
+# pending index: DATA_DIR/pending/<fp>, one empty marker per proof that still
+# waits for its Bitcoin attestation. The marker is written BEFORE the proof
+# (a proof without a marker would never be upgraded; a marker without a proof
+# is dropped by the upgrader) and removed once the anchored bytes are on disk.
+# The upgrader lists this directory instead of reading every proof file.
+def pending_path(cfg, fp):
+    return os.path.join(cfg["pending_dir"], fp)
+
+
+def pending_mark(cfg, fp):
+    try:
+        fd = os.open(pending_path(cfg, fp), os.O_WRONLY | os.O_CREAT, 0o600)
+        os.close(fd)
+    except OSError:
+        log_event(cfg, "cannot_mark_pending", fp=fp)
+
+
+def pending_clear(cfg, fp):
+    try:
+        os.unlink(pending_path(cfg, fp))
+    except OSError:
+        pass
+
+
+def list_pending(cfg):
+    try:
+        names = os.listdir(cfg["pending_dir"])
+    except OSError:
+        return []
+    return sorted(n for n in names if HEX64.fullmatch(n))
+
+
+PENDING_BUILT = ".built"
+
+
+def build_pending_index(cfg):
+    """One scan of the proofs directory (a DATA_DIR from before the index):
+    every proof without a Bitcoin attestation gets a marker. Idempotent —
+    a crash mid-scan leaves the .built flag absent and the next pass scans
+    again. Returns (pending, scanned)."""
+    pending = scanned = 0
+    for fp in list_proofs(cfg):
+        scanned += 1
+        try:
+            with open(proof_path(cfg, fp), "rb") as f:
+                data = f.read()
+        except OSError:
+            continue
+        if not is_anchored(data):
+            pending_mark(cfg, fp)
+            pending += 1
+    fd = os.open(os.path.join(cfg["pending_dir"], PENDING_BUILT),
+                 os.O_WRONLY | os.O_CREAT, 0o600)
+    os.close(fd)
+    fsync_dir(cfg["pending_dir"])
+    return pending, scanned
+
+
 def load_sidecar(path):
     """(None, 0) when absent; ({}, age) when present but unreadable;
     (dict, age) when well-formed. Age comes from mtime, which only changes
@@ -499,10 +585,17 @@ def load_sidecar(path):
     return {}, age
 
 
-def write_sidecar(path, macaroon, invoice, preimage=None):
+def write_sidecar(path, macaroon, invoice, preimage=None, attempts=0, attention=None):
+    """The in-flight purchase record. attempts counts definite redeem
+    refusals of a paid preimage; attention is the UTC time the ceiling was
+    reached (the operator's signal: the box holds a paid, unredeemed proof)."""
     d = {"macaroon": macaroon, "invoice": invoice}
     if preimage:
         d["preimage"] = preimage
+    if attempts:
+        d["attempts"] = attempts
+    if attention:
+        d["attention"] = attention
     atomic_write(path, (json.dumps(d) + "\n").encode())
 
 
@@ -557,7 +650,9 @@ def _mark_up(cfg, flags, which):
         log_event(cfg, which + "_recovered")
 
 
-def _redeem(cfg, fp, macaroon, preimage, amt, flags):
+def _redeem(cfg, fp, macaroon, preimage, amt, flags, sidecar=None):
+    """sidecar is the stored in-flight record when this is a retry of a paid
+    preimage; a definite refusal is counted on it (J9)."""
     try:
         status, headers, body = gateway_redeem(cfg, fp, macaroon, preimage)
     except Unreachable:
@@ -565,8 +660,16 @@ def _redeem(cfg, fp, macaroon, preimage, amt, flags):
     _mark_up(cfg, flags, "gateway")
     if status == 200:
         if looks_like_ots(body):
+            if proof_digest(body) != fp:
+                # A proof of somebody else's digest is not ours to store: the
+                # sidecar keeps the preimage and the next pass asks again.
+                log_event(cfg, "proof_wrong_digest", fp=fp, note="paid",
+                          got=(proof_digest(body) or "none")[:12])
+                return True
+            pending_mark(cfg, fp)
             atomic_write(proof_path(cfg, fp), body)
             clear_debt(cfg, fp)
+            flags["attention"].discard(fp)
             log_event(cfg, "bought", fp=fp,
                       sats=amt if amt is not None else "unknown")
             return True
@@ -578,12 +681,31 @@ def _redeem(cfg, fp, macaroon, preimage, amt, flags):
         flags["retry_at"][0] = time.time() + wait
         log_event(cfg, "rate_limited", wait_secs=wait)
         return False
-    # Paid but not redeemed. The sidecar (macaroon + preimage) stays and
-    # every pass retries forever; the gateway's rule is that settlement
-    # outranks expiry.
-    log_event(cfg, "redeem_failed", fp=fp, status=status,
-              note="paid_but_unredeemed")
-    return status != 503
+    # Paid but not redeemed. The sidecar (macaroon + preimage) stays — the
+    # gateway's rule is that settlement outranks expiry — and is retried
+    # every pass up to REDEEM_ATTEMPTS_MAX definite refusals, then once per
+    # REDEEM_ATTENTION_RETRY_SECS under a needs-attention mark. A 503 is
+    # the gateway saying "not now", not a refusal: it ends the pass and
+    # counts nothing.
+    if status == 503:
+        log_event(cfg, "redeem_failed", fp=fp, status=status, note="paid_but_unredeemed")
+        return False
+    attempts = (sidecar or {}).get("attempts", 0)
+    attempts = attempts + 1 if isinstance(attempts, int) else 1
+    attention = (sidecar or {}).get("attention") if sidecar else None
+    if attention is None and attempts >= cfg["redeem_attempts_max"]:
+        attention = utc_now_iso()
+        log_event(cfg, "redeem_needs_attention", fp=fp, status=status, attempts=attempts,
+                  note="paid_preimage_kept_retry_every_%ds" % cfg["redeem_attention_retry_secs"])
+    elif attention is None:
+        log_event(cfg, "redeem_failed", fp=fp, status=status, note="paid_but_unredeemed")
+    if sidecar is not None:
+        try:
+            write_sidecar(sidecar_path(cfg, fp), macaroon, sidecar.get("invoice", ""),
+                          preimage, attempts=attempts, attention=attention)
+        except OSError:
+            log_event(cfg, "cannot_write_sidecar", fp=fp)
+    return True
 
 
 def _pay_and_redeem(cfg, password, fp, macaroon, invoice, amt, flags):
@@ -626,7 +748,13 @@ def finish_sidecar(cfg, password, fp, sc, age, flags):
     macaroon, invoice, preimage = sc.get("macaroon"), sc.get("invoice"), sc.get("preimage")
 
     if isinstance(preimage, str) and isinstance(macaroon, str):
-        return _redeem(cfg, fp, macaroon, preimage, None, flags)
+        if sc.get("attention") and age < cfg["redeem_attention_retry_secs"]:
+            # At the ceiling: the paid preimage waits, quietly, for its
+            # hourly retry (age is the sidecar's mtime, rewritten on every
+            # counted refusal).
+            flags["attention"].add(fp)
+            return True
+        return _redeem(cfg, fp, macaroon, preimage, None, flags, sidecar=sc)
 
     if isinstance(macaroon, str) and isinstance(invoice, str):
         if age <= cfg["l402_expiry_secs"]:
@@ -726,6 +854,11 @@ def _buy_challenged(cfg, password, fp, status, headers, body, day, spent, flags)
     if status == 200 and looks_like_ots(body):
         # The gateway handed the proof over without charging: its free door
         # (L402_ENABLED=false).
+        if proof_digest(body) != fp:
+            log_event(cfg, "proof_wrong_digest", fp=fp, note="free",
+                      got=(proof_digest(body) or "none")[:12])
+            return True  # the debt stays; the next pass asks again
+        pending_mark(cfg, fp)
         atomic_write(proof_path(cfg, fp), body)
         clear_debt(cfg, fp)
         log_event(cfg, "proof_free", fp=fp)
@@ -810,7 +943,7 @@ def _buyer_pass_inflight(cfg, password, flags):
     breaker gate every new submission just as they gate every serial debt;
     a stop (429, 503, gateway unreachable, ledger unreadable) still lets the
     answers already in flight land, then ends the pass — any 402 among them
-    is simply owed again next pass, unpaid and unreserved."""
+    is owed again next pass, unpaid and unreserved."""
     br = flags["breaker"]
     n = cfg["inflight"]
     queue = list_debts_oldest_first(cfg)
@@ -903,12 +1036,14 @@ def buyer_loop(cfg, password, hb):
         "ledger": StateChange(),
         "budget": StateChange(),
         "retry_at": [0.0],
+        "attention": set(),   # fps whose paid preimage sits at the redeem ceiling
         "corrupt_logged": set(),
         # The circuit breaker lives in memory only, by design: a process
         # killed while paused starts closed and re-trips if the fault holds.
         "breaker": {"failures": 0, "open": False, "wait": 0.0, "until": 0.0},
     }
     hb["breaker"] = flags["breaker"]  # the heartbeat reports open/closed
+    hb["attention"] = flags["attention"]  # ... and how many paid proofs wait at the ceiling
     while True:
         hb["buyer"] = time.time()
         try:
@@ -919,65 +1054,108 @@ def buyer_loop(cfg, password, hb):
 
 
 # the upgrader
+def _apply_upgrade(cfg, fp, path, body):
+    """One /upgrade answer for fp. The file is replaced only when the
+    response says bitcoin_anchored and the returned bytes agree; the marker
+    is cleared after the anchored bytes are on disk. True when anchored."""
+    try:
+        resp = json.loads(body)
+    except ValueError:
+        log_event(cfg, "upgrade_failed", fp=fp, status="bad_json")
+        return False
+    if not isinstance(resp, dict) or resp.get("status") == "pending":
+        return False  # normal: Bitcoin has not confirmed yet
+    if resp.get("bitcoin_anchored") is True and isinstance(resp.get("ots"), str):
+        try:
+            new_bytes = base64.b64decode(resp["ots"], validate=True)
+        except ValueError:
+            log_event(cfg, "upgrade_failed", fp=fp, status="bad_base64")
+            return False
+        if looks_like_ots(new_bytes) and is_anchored(new_bytes):
+            if proof_digest(new_bytes) != fp:
+                log_event(cfg, "proof_wrong_digest", fp=fp, note="upgrade",
+                          got=(proof_digest(new_bytes) or "none")[:12])
+                return False  # the pending proof and its marker stay
+            try:
+                atomic_write(path, new_bytes)
+            except OSError:
+                log_event(cfg, "upgrade_failed", fp=fp, status="write_failed")
+                return False
+            pending_clear(cfg, fp)
+            log_event(cfg, "anchored", fp=fp)
+            return True
+        log_event(cfg, "upgrade_failed", fp=fp,
+                  status="anchored_reply_without_anchored_bytes")
+        return False
+    # invalid / mismatch / no_attestations: our artifact is wrong — loud.
+    log_event(cfg, "upgrade_needs_attention", fp=fp, status=resp.get("status"))
+    return False
+
+
 def upgrade_pass(cfg, flags):
-    """POST each still-pending proof to the gateway's free /upgrade (JSON in,
-    JSON out, ots base64 both ways). The file is replaced only when the
-    response says bitcoin_anchored and the returned bytes agree."""
+    """POST each still-pending proof to the gateway's /upgrade (JSON in, JSON
+    out, ots base64 both ways), working from the pending index rather than
+    the proofs directory, up to UPGRADE_INFLIGHT calls in the air. The
+    worker threads do only the HTTP call; every answer, file write and
+    marker is handled here, on the upgrader thread. A 429, a 503 or an
+    unreachable gateway stops new submissions; the answers already in
+    flight land, then the pass ends."""
+    if not os.path.exists(os.path.join(cfg["pending_dir"], PENDING_BUILT)):
+        pending, scanned = build_pending_index(cfg)
+        log_event(cfg, "pending_index_built", pending=pending, scanned=scanned)
     checked = 0
     newly_anchored = 0
-    for fp in list_proofs(cfg):
-        path = proof_path(cfg, fp)
-        try:
-            with open(path, "rb") as f:
-                data = f.read()
-        except OSError:
-            continue
-        if is_anchored(data):
-            continue
-        checked += 1
-        try:
-            status, headers, body = gateway_upgrade(cfg, fp, data)
-        except Unreachable:
-            _mark_down(cfg, flags, "upgrade_gateway")
-            break
-        _mark_up(cfg, flags, "upgrade_gateway")
-        if status == 429:
-            log_event(cfg, "upgrade_rate_limited",
-                      wait_secs=_retry_after_secs(headers))
-            break
-        if status != 200:
-            log_event(cfg, "upgrade_failed", fp=fp, status=status)
-            if status == 503:
-                break
-            continue
-        try:
-            resp = json.loads(body)
-        except ValueError:
-            log_event(cfg, "upgrade_failed", fp=fp, status="bad_json")
-            continue
-        if not isinstance(resp, dict) or resp.get("status") == "pending":
-            continue  # normal: Bitcoin has not confirmed yet
-        if resp.get("bitcoin_anchored") is True and isinstance(resp.get("ots"), str):
-            try:
-                new_bytes = base64.b64decode(resp["ots"], validate=True)
-            except ValueError:
-                log_event(cfg, "upgrade_failed", fp=fp, status="bad_base64")
-                continue
-            if looks_like_ots(new_bytes) and is_anchored(new_bytes):
+    queue = list_pending(cfg)
+    idx = 0
+    outstanding = {}   # future -> (fp, path)
+    stop = False
+    n = cfg["upgrade_inflight"]
+    with ThreadPoolExecutor(max_workers=n, thread_name_prefix="upgrade") as pool:
+        while True:
+            while not stop and idx < len(queue) and len(outstanding) < n:
+                fp = queue[idx]
+                idx += 1
+                path = proof_path(cfg, fp)
                 try:
-                    atomic_write(path, new_bytes)
-                except OSError:
-                    log_event(cfg, "upgrade_failed", fp=fp, status="write_failed")
+                    with open(path, "rb") as f:
+                        data = f.read()
+                except FileNotFoundError:
+                    pending_clear(cfg, fp)  # a marker without its proof
                     continue
-                newly_anchored += 1
-                log_event(cfg, "anchored", fp=fp)
-            else:
-                log_event(cfg, "upgrade_failed", fp=fp,
-                          status="anchored_reply_without_anchored_bytes")
-            continue
-        # invalid / mismatch / no_attestations: our artifact is wrong — loud.
-        log_event(cfg, "upgrade_needs_attention", fp=fp,
-                  status=resp.get("status"))
+                except OSError:
+                    continue
+                if is_anchored(data):
+                    pending_clear(cfg, fp)  # finished by an earlier pass
+                    continue
+                checked += 1
+                outstanding[pool.submit(gateway_upgrade, cfg, fp, data)] = (fp, path)
+            if not outstanding:
+                break
+            done, _ = wait_futures(outstanding, return_when=FIRST_COMPLETED)
+            for fut in done:
+                fp, path = outstanding.pop(fut)
+                exc = fut.exception()
+                if exc is not None:
+                    if isinstance(exc, Unreachable):
+                        _mark_down(cfg, flags, "upgrade_gateway")
+                        stop = True
+                        continue
+                    raise exc
+                _mark_up(cfg, flags, "upgrade_gateway")
+                status, headers, body = fut.result()
+                if status == 429:
+                    if not stop:
+                        log_event(cfg, "upgrade_rate_limited",
+                                  wait_secs=_retry_after_secs(headers))
+                    stop = True
+                    continue
+                if status != 200:
+                    log_event(cfg, "upgrade_failed", fp=fp, status=status)
+                    if status == 503:
+                        stop = True
+                    continue
+                if _apply_upgrade(cfg, fp, path, body):
+                    newly_anchored += 1
     if checked:
         log_event(cfg, "upgrade_pass", checked=checked, anchored=newly_anchored)
 
@@ -1002,11 +1180,12 @@ def _ts_or_never(t):
 
 def write_heartbeat(cfg, hb):
     br = hb.get("breaker") or {}
-    line = "{} pid={} buyer={} breaker={} upgrader={}\n".format(
+    line = "{} pid={} buyer={} breaker={} upgrader={} attention={}\n".format(
         utc_now_iso(), os.getpid(),
         _ts_or_never(hb.get("buyer")),
         "paused" if br.get("open") else "ok",
-        _ts_or_never(hb.get("upgrader")))
+        _ts_or_never(hb.get("upgrader")),
+        len(hb.get("attention") or ()))
     try:
         atomic_write(cfg["heartbeat_path"], line.encode())
     except OSError:
@@ -1134,6 +1313,7 @@ def main():
         password = read_phoenix_password(cfg["phoenix_conf"])
         os.makedirs(cfg["debts_dir"], exist_ok=True)
         os.makedirs(cfg["proofs_dir"], exist_ok=True)
+        os.makedirs(cfg["pending_dir"], exist_ok=True)
     except ConfigError as e:
         print(f"api-endpoint: {e}", file=sys.stderr)
         return 2
@@ -1157,6 +1337,7 @@ def main():
               upgrade_secs=cfg["upgrade_secs"],
               debts=len(list_debts_oldest_first(cfg)),
               proofs=len(list_proofs(cfg)),
+              pending=len(list_pending(cfg)),
               **({"inflight": cfg["inflight"]} if cfg["inflight"] > 1 else {}))
 
     hb = {}

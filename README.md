@@ -28,10 +28,11 @@ One route. Everything else is the filesystem.
 | Path | Meaning |
 |---|---|
 | `debts/<fp>` | owed fingerprint; written and fsynced **before** "received" goes out — the debt is the promise |
-| `debts/<fp>.l402` | in-flight purchase: the L402 challenge, plus the preimage once paid |
+| `debts/<fp>.l402` | in-flight purchase: the L402 challenge, plus the preimage once paid; `attempts` / `attention` once the gateway keeps refusing that preimage |
 | `proofs/<fp>.ots` | the bought proof; anchored once its bytes carry a Bitcoin block-header attestation |
+| `pending/<fp>` | empty marker for a proof still waiting for its Bitcoin attestation — written before the proof, removed once the anchored bytes are on disk; the upgrader works from this index and never re-reads the proofs directory (a data dir from before the index is scanned once at the first upgrade pass, `pending_index_built` in the log) |
 | `ledger` | one line `YYYY-MM-DD SPENT_SATS` per UTC day — attempts, not successes |
-| `heartbeat` | one line: time, pid, buyer/upgrader last-pass times, breaker state |
+| `heartbeat` | one line: time, pid, buyer/upgrader last-pass times, breaker state, `attention=N` paid-but-refused sidecars at the retry ceiling |
 | `log` | append-only fixed-format events |
 
 ## Config
@@ -54,6 +55,10 @@ Precedence: invocation env > `.env` beside the script > defaults.
 | `CIRCUIT_BREAKER_FAILURES` | 5 | consecutive payment failures before purchasing pauses |
 | `CIRCUIT_BREAKER_PAUSE_SECS` | 60 | initial pause; doubles per failed probe, capped at 3600 |
 | `INFLIGHT` | 1 | gateway submissions the buyer may hold in the air at once (strict positive int); 1 = the serial pass |
+| `UPGRADE_INFLIGHT` | = `INFLIGHT` | `/upgrade` calls the upgrader may hold in the air at once (strict positive int) |
+| `GATEWAY_UPGRADE_TOKEN` | (unset) | the gateway's `UPGRADE_CLIENT_TOKEN`, presented as a bearer on `/upgrade` so this client is not throttled by the gateway's per-peer verify budget (30 a minute by default — a free door hands out far more than that); unset = anonymous, throttled |
+| `REDEEM_ATTEMPTS_MAX` | 300 | definite refusals of a paid preimage (every pass) before the sidecar is marked needs-attention |
+| `REDEEM_ATTENTION_RETRY_SECS` | 3600 | how often a needs-attention sidecar is retried after that |
 | `LOG_CAP_BYTES` | 16777216 | once `log` reaches this many bytes the next event renames it to `log.1` (replacing any previous `.1`) and starts fresh; 0 = never rotate |
 
 ## Money rules
@@ -70,6 +75,10 @@ Precedence: invocation env > `.env` beside the script > defaults.
   paused; the backlog drains oldest-first when it resumes.
 - The phoenixd password lives only in memory and an Authorization header —
   no subprocesses, so never in argv; never logged.
+- A proof is stored only if it is a proof of the fingerprint this box asked
+  for — on the free door, on a paid redeem and on an upgrade alike. Anything
+  else the gateway hands back is refused and logged `proof_wrong_digest`;
+  the debt (or the pending proof) stays and the next pass asks again.
 
 ## Concurrency: `INFLIGHT`
 
@@ -122,11 +131,23 @@ stub never throttles unless told to.**
 ## Debt lifecycle
 
 owed (`debts/<fp>`) → in-flight (`debts/<fp>.l402`: challenged, then paid)
-→ proof (`proofs/<fp>.ots`, pending) → anchored (the free upgrader loop
-polls `/upgrade` until the proof's bytes carry a Bitcoin block-header
-attestation). A stale unpaid challenge past `L402_EXPIRY_SECS` is
+→ proof (`proofs/<fp>.ots`, pending, with a `pending/<fp>` marker) → anchored (the
+upgrader loop polls `/upgrade` for every marker, `UPGRADE_INFLIGHT` at a
+time, until the proof's bytes carry a Bitcoin block-header attestation;
+the marker goes once they do). A stale unpaid challenge past `L402_EXPIRY_SECS` is
 abandoned and re-challenged, loudly. Debts and sidecars carry everything
 across a death; there is no shutdown sequence.
+
+A paid preimage the gateway keeps refusing (after an L402 secret rotation
+every stored macaroon is a 401) is never dropped and never re-paid:
+settlement outranks expiry. It is retried every pass up to
+`REDEEM_ATTEMPTS_MAX` definite refusals — a 503 is "not now", ends the
+pass, and counts nothing — then the sidecar carries `attempts` and an
+`attention` time, one `redeem_needs_attention` line is logged, the
+heartbeat's `attention=N` counts such sidecars, and the retry continues
+once per `REDEEM_ATTENTION_RETRY_SECS` in silence. A gateway that accepts
+the token again heals it on the next slow retry; an operator who wants
+it now deletes the `attention` key from the sidecar.
 
 ## Running it
 
@@ -134,7 +155,7 @@ across a death; there is no shutdown sequence.
 LISTEN_ADDR=127.0.0.1:8402 GATEWAY_URL=http://... python3 api_endpoint.py
 ```
 
-The suite (26 tests, no network, no phoenixd):
+The suite (41 tests, no network, no phoenixd):
 
 ```bash
 python3 -m unittest test_api_endpoint -v
@@ -161,7 +182,7 @@ rotation to it entirely. Proven by `test_log_rotates_to_dot1_at_cap_and_replaces
 
 ## Claims, labelled
 
-Proven by the 29-test suite and the live smoke: the door contract
+Proven by the 41-test suite and the live smoke: the door contract
 (including 411/400/405 refusals and the durable-debt-before-received
 ordering), the budget/breaker/ledger rules, anchored-vs-pending detection
 against real fixture proofs, the `INFLIGHT` pins listed above, and one
@@ -170,7 +191,16 @@ by test name:
 `test_sigkill_mid_burst_every_acked_record_bought`,
 `test_kill_inside_pay_to_redeem_window_exactly_one_payment`,
 `test_corrupt_ledger_pauses_purchases_never_intake`,
-`test_anchored_detector_against_real_proofs`.
+`test_anchored_detector_against_real_proofs`. A proof of somebody else's
+digest is refused on every path: `test_free_door_wrong_digest_refused_then_bought`,
+`test_paid_redeem_wrong_digest_refused`, `test_upgrade_wrong_digest_refused_keeps_pending`.
+The backlog finishes and the pending index is built once
+(`test_upgrade_backlog_finishes_with_the_client_token`,
+`test_pending_index_built_once_from_the_proofs_dir`); a paid preimage the
+gateway keeps refusing hits the ceiling once, is never re-paid, and heals
+on the slow retry (`test_ceiling_marks_attention_once_and_keeps_the_preimage`,
+`test_at_the_ceiling_the_retry_is_slow_and_a_fixed_gateway_heals_it`,
+`test_503_counts_nothing`).
 
 **Unproven: the live anchored upgrade end-to-end (the upgrader has only
 been proven against fixtures, not a live anchor cycle), sustained volume,

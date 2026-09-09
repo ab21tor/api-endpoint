@@ -83,11 +83,13 @@ print(f"anchored: {api_endpoint.is_anchored(data)} (pending is the pass)")
 EOF
 [ $? -eq 0 ] || exit 5
 
-# Exactly one purchase, settled debt, budget recorded.
+# Exactly one proof event — bought on the paid door, proof_free on a free
+# one — settled debt, budget recorded.
 BOUGHT=$(grep -c " bought fp=$FP" log)
-[ "$BOUGHT" = "1" ] || { echo "smoke: expected exactly one bought line for $FP, got $BOUGHT" >&2; exit 6; }
+FREE=$(grep -c " proof_free fp=$FP" log)
+[ $((BOUGHT + FREE)) -eq 1 ] || { echo "smoke: expected exactly one bought or proof_free line for $FP, got bought=$BOUGHT proof_free=$FREE" >&2; exit 6; }
 [ -z "$(ls debts 2>/dev/null)" ] || { echo "smoke: debts/ not settled" >&2; exit 6; }
 echo "startup: $(grep ' startup ' log | tail -1)"
-echo "bought:  $(grep " bought fp=$FP" log | tail -1)"
+echo "proof:   $(grep -E " (bought|proof_free) fp=$FP" log | tail -1)"
 echo "ledger:  $(cat ledger 2>/dev/null || echo '<none>')"
 echo "smoke: PASS — one record, one payment, one pending proof at proofs/$FP.ots"
