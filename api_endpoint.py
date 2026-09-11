@@ -3,8 +3,14 @@
 
 Client systems POST records to a local listener. Each record is SHA-256
 fingerprinted in memory (raw bytes are never written and never logged) and
-each fingerprint buys its own OpenTimestamps proof from a Lightning-paid
-L402 timestamp gateway, paid via the payer phoenixd.
+each fingerprint gets its own OpenTimestamps proof, in one of two shapes:
+
+  hosted    GATEWAY_URL  — bought from a Lightning-paid L402 timestamp
+                           gateway, paid via the payer phoenixd (or handed
+                           over by the gateway's free door);
+  appliance CALENDAR_URL — submitted straight to the box's own calendar
+                           (the opentimestamps-server fork's counted
+                           /digest), no payment anywhere.
 
 One route: POST /record. Everything else is the filesystem under DATA_DIR
 (debts/, proofs/, pending/, ledger, heartbeat, log). Config, file semantics, and the
@@ -12,6 +18,7 @@ money rules: README.md.
 """
 
 import base64
+import collections
 import http.client
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
 from concurrent.futures import wait as wait_futures
@@ -40,7 +47,147 @@ HEX64_ANYCASE = re.compile(r"[0-9a-fA-F]{64}")
 # means the proof carries a Bitcoin block-header attestation: anchored.
 # Checked against a real anchored proof and a real pending proof in the tests.
 OTS_MAGIC = b"\x00OpenTimestamps\x00\x00Proof\x00\xbf\x89\xe2\xe8\x84\xe8\x92\x94"
-BITCOIN_ATTESTATION = b"\x00" + bytes.fromhex("0588960d73d71901")
+BITCOIN_TAG = bytes.fromhex("0588960d73d71901")
+BITCOIN_ATTESTATION = b"\x00" + BITCOIN_TAG
+
+# OpenTimestamps proof bytes, the subset a single calendar emits — a COPY of
+# the parser in the fork's ops/selfstamp.py (2026-09-11), kept here because
+# this file is one stdlib file with no sibling to import from. The two
+# copies are cross-checked against the opentimestamps library by their
+# tests where it is importable; a change to one is a change to both.
+OTS_VERSION = 1
+OP_SHA256 = 0x08
+OP_APPEND = 0xF0
+OP_PREPEND = 0xF1
+ATTESTATION_MARKER = 0x00
+FORK_MARKER = 0xFF
+PENDING_TAG = bytes.fromhex("83dfe30d2ef90c8e")
+
+Proof = collections.namedtuple("Proof", "digest commitment attestation ops_end")
+
+
+class OtsError(Exception):
+    """A proof this adapter cannot read or must not write."""
+
+
+def varuint(n):
+    out = bytearray()
+    while True:
+        byte = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def read_varuint(data, pos):
+    value = 0
+    shift = 0
+    while True:
+        if pos >= len(data):
+            raise OtsError("truncated varuint")
+        byte = data[pos]
+        pos += 1
+        value |= (byte & 0x7F) << shift
+        shift += 7
+        if not byte & 0x80:
+            return value, pos
+
+
+def read_varbytes(data, pos):
+    length, pos = read_varuint(data, pos)
+    if pos + length > len(data):
+        raise OtsError("truncated varbytes")
+    return data[pos:pos + length], pos + length
+
+
+def parse_ots(data):
+    """Read a linear detached proof: header, sha256 op, 32-byte digest, a
+    chain of sha256/append/prepend ops, one attestation. Returns Proof with
+    the message the attestation is about (the commitment) and the offset
+    of the attestation marker (the splice point for an upgrade). Anything
+    else — a fork marker, an op the calendar never emits, trailing bytes —
+    is refused rather than guessed at."""
+    if data[:len(OTS_MAGIC)] != OTS_MAGIC:
+        raise OtsError("not an OpenTimestamps proof (bad magic)")
+    pos = len(OTS_MAGIC)
+    version, pos = read_varuint(data, pos)
+    if version != OTS_VERSION:
+        raise OtsError("unsupported proof version %d" % version)
+    if pos >= len(data) or data[pos] != OP_SHA256:
+        raise OtsError("file hash op is not sha256")
+    pos += 1
+    digest = data[pos:pos + 32]
+    if len(digest) != 32:
+        raise OtsError("truncated digest")
+    pos += 32
+    msg = digest
+    while True:
+        if pos >= len(data):
+            raise OtsError("truncated: no attestation")
+        tag = data[pos]
+        if tag == ATTESTATION_MARKER:
+            ops_end = pos
+            pos += 1
+            atag = data[pos:pos + 8]
+            if len(atag) != 8:
+                raise OtsError("truncated attestation tag")
+            pos += 8
+            payload, pos = read_varbytes(data, pos)
+            if atag == PENDING_TAG:
+                uri, _ = read_varbytes(payload, 0)
+                attestation = ("pending", uri.decode("utf-8"))
+            elif atag == BITCOIN_TAG:
+                height, _ = read_varuint(payload, 0)
+                attestation = ("bitcoin", height)
+            else:
+                attestation = ("unknown", atag.hex())
+            if pos != len(data):
+                raise OtsError("trailing bytes after the attestation")
+            return Proof(digest, msg, attestation, ops_end)
+        if tag == FORK_MARKER:
+            raise OtsError("non-linear timestamp (fork marker); use the ots client")
+        pos += 1
+        if tag == OP_SHA256:
+            msg = sha256(msg).digest()
+        elif tag == OP_APPEND:
+            operand, pos = read_varbytes(data, pos)
+            msg = msg + operand
+        elif tag == OP_PREPEND:
+            operand, pos = read_varbytes(data, pos)
+            msg = operand + msg
+        else:
+            raise OtsError("unsupported op 0x%02x" % tag)
+
+
+def build_ots(digest, calendar_response):
+    """The calendar's answer to a digest POST is the serialized timestamp of
+    that digest; prefixing the detached-file header makes it a .ots file,
+    byte-for-byte what the ots client writes for a single calendar."""
+    ots = OTS_MAGIC + varuint(OTS_VERSION) + bytes([OP_SHA256]) + digest + calendar_response
+    proof = parse_ots(ots)
+    if proof.digest != digest:
+        raise OtsError("digest mismatch while building the proof")
+    return ots
+
+
+def splice_upgrade(ots, calendar_response):
+    """Replace a pending attestation with the calendar's timestamp of the
+    commitment (its path up the anchor tree ending in a Bitcoin
+    attestation). Refused unless the result is a complete, linear proof of
+    the same digest."""
+    proof = parse_ots(ots)
+    if proof.attestation[0] != "pending":
+        raise OtsError("proof is not pending")
+    upgraded = ots[:proof.ops_end] + calendar_response
+    new = parse_ots(upgraded)
+    if new.attestation[0] != "bitcoin":
+        raise OtsError("upgrade response carries no Bitcoin attestation")
+    if new.digest != proof.digest:
+        raise OtsError("digest changed by the upgrade")
+    return upgraded
 
 # An X-Digest: sha256 body is 64 hex chars plus whatever whitespace a shell
 # pipeline appends; anything bigger than this is not a digest.
@@ -113,12 +260,31 @@ def resolve_config(environ, script_dir=SCRIPT_DIR):
             f"LISTEN_ADDR must be host:port, e.g. 127.0.0.1:8402 — got {listen!r}"
         )
 
+    # The shape: exactly one of the two doors. GATEWAY_URL is the hosted
+    # shape (an L402 timestamp gateway, paid or free door); CALENDAR_URL is
+    # the appliance shape (the box's own calendar, submitted to directly,
+    # nothing paid anywhere).
     gateway = get("GATEWAY_URL")
-    if not gateway:
+    calendar = get("CALENDAR_URL")
+    if gateway and calendar:
+        raise ConfigError(
+            "set exactly one of GATEWAY_URL and CALENDAR_URL — both are set; "
+            "GATEWAY_URL is the hosted shape (an L402 timestamp gateway), "
+            "CALENDAR_URL the appliance shape (the box's own calendar)"
+        )
+    if not gateway and not calendar:
         raise ConfigError(
             "set GATEWAY_URL, e.g. http://127.0.0.1:8000 — the L402 timestamp "
-            "gateway this box buys proofs from"
+            "gateway this box buys proofs from (hosted shape) — or "
+            "CALENDAR_URL, e.g. http://127.0.0.1:14788 — the calendar this box "
+            "submits to directly (appliance shape); exactly one"
         )
+    mode = "calendar" if calendar else "gateway"
+    # The appliance defaults (2026-09-11): eight submissions in the air and
+    # one upgrade pass an hour (each pass is one loopback GET per pending
+    # proof). The hosted defaults are unchanged: serial, ten minutes.
+    inflight_default = "8" if mode == "calendar" else "1"
+    upgrade_secs_default = "3600" if mode == "calendar" else "600"
 
     def uint(key, default):
         raw = get(key, default)
@@ -146,14 +312,16 @@ def resolve_config(environ, script_dir=SCRIPT_DIR):
     return {
         "listen_host": host,
         "listen_port": int(port_s),
-        "gateway_url": gateway.rstrip("/"),
+        "mode": mode,
+        "gateway_url": gateway.rstrip("/") if gateway else None,
+        "calendar_url": calendar.rstrip("/") if calendar else None,
         "phoenixd_url": get("PHOENIXD_URL", "http://127.0.0.1:9740").rstrip("/"),
         "phoenix_conf": get("PHOENIX_CONF",
                             os.path.expanduser("~/.phoenix/phoenix.conf")),
         "max_price_sats": uint("MAX_PRICE_SATS", "5000"),
         "daily_budget_sats": uint("DAILY_BUDGET_SATS", "200000"),
         "poll_secs": secs("POLL_SECS", "2"),
-        "upgrade_secs": secs("UPGRADE_SECS", "600"),
+        "upgrade_secs": secs("UPGRADE_SECS", upgrade_secs_default),
         "heartbeat_secs": secs("HEARTBEAT_SECS", "10"),
         "l402_expiry_secs": secs("L402_EXPIRY_SECS", "3600"),
         # J9 (2026-09-08): a paid-but-unredeemed sidecar is retried every
@@ -164,9 +332,10 @@ def resolve_config(environ, script_dir=SCRIPT_DIR):
         "redeem_attention_retry_secs": secs("REDEEM_ATTENTION_RETRY_SECS", "3600"),
         "breaker_failures": uint("CIRCUIT_BREAKER_FAILURES", "5"),
         "breaker_pause_secs": secs("CIRCUIT_BREAKER_PAUSE_SECS", "60"),
-        "inflight": pint("INFLIGHT", "1"),
+        "inflight": pint("INFLIGHT", inflight_default),
         # The upgrader's own window; defaults to INFLIGHT.
-        "upgrade_inflight": pint("UPGRADE_INFLIGHT", get("INFLIGHT", "1") or "1"),
+        "upgrade_inflight": pint("UPGRADE_INFLIGHT",
+                                 get("INFLIGHT", inflight_default) or inflight_default),
         # Presented as a bearer on /upgrade so the gateway lifts its per-peer
         # throttle for this client (its UPGRADE_CLIENT_TOKEN). Unset = anonymous.
         "gateway_upgrade_token": get("GATEWAY_UPGRADE_TOKEN") or None,
@@ -388,6 +557,23 @@ def http_post(url, body, headers, timeout):
         raise Unreachable(type(e).__name__)
 
 
+def http_get(url, timeout, headers=None):
+    """GET returning (status, headers, body_bytes); 4xx/5xx are returned,
+    not raised; only transport failures raise Unreachable."""
+    req = urllib.request.Request(url, headers=dict(headers or {}), method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.headers, resp.read()
+    except urllib.error.HTTPError as e:
+        try:
+            resp_body = e.read()
+        except OSError:
+            resp_body = b""
+        return e.code, e.headers if e.headers is not None else {}, resp_body
+    except (OSError, http.client.HTTPException) as e:
+        raise Unreachable(type(e).__name__)
+
+
 def gateway_challenge(cfg, fp):
     return http_post(cfg["gateway_url"] + "/timestamp",
                      json.dumps({"digest": fp}).encode(),
@@ -411,6 +597,99 @@ def gateway_upgrade(cfg, fp, ots_bytes):
         headers["Authorization"] = "Bearer " + cfg["gateway_upgrade_token"]
     return http_post(cfg["gateway_url"] + "/upgrade", body.encode(), headers,
                      timeout=60)
+
+
+# The appliance shape: the calendar protocol (opentimestamps-server fork,
+# otsserver/rpc.py), spoken directly. Both functions answer in the shape
+# their gateway counterparts answer, so everything after the transport —
+# the proof_digest refusal, the pending marker, the atomic write, clear_debt,
+# _apply_upgrade — is the same code in both shapes.
+def calendar_submit(cfg, fp):
+    """POST the 32 raw digest bytes to the calendar's counted door, /digest
+    (never the operator lane, /operator/digest, which is the self-stamper's
+    and is not a record), and turn the serialized pending timestamp it
+    answers into the detached proof. Returns the (status, headers, body)
+    triple gateway_challenge returns: on 200 the body is the proof, which
+    _buy_challenged stores exactly as a free-door answer. An answer that is
+    not a pending timestamp of this digest is logged
+    calendar_answer_rejected and returned with an empty body, which
+    _buy_challenged treats as challenge_failed: the debt stays and the next
+    pass asks again. 503 (the aggregator wedged or gone) ends the pass as a
+    gateway 503 does."""
+    digest = bytes.fromhex(fp)
+    status, headers, body = http_post(cfg["calendar_url"] + "/digest", digest,
+                                      {"Content-Type": "application/octet-stream"},
+                                      timeout=60)
+    if status != 200:
+        return status, headers, body
+    try:
+        ots = build_ots(digest, body)
+        if parse_ots(ots).attestation[0] != "pending":
+            raise OtsError("answer carries no pending attestation")
+    except OtsError as exc:
+        log_event(cfg, "calendar_answer_rejected", fp=fp,
+                  reason=str(exc).replace(" ", "_"))
+        return 200, headers, b""
+    return 200, headers, ots
+
+
+def calendar_upgrade(cfg, fp, ots_bytes):
+    """Walk the pending proof to its commitment, ask the calendar for that
+    commitment's timestamp (GET /timestamp/<hex>: 404 while pending, the
+    path to the Bitcoin attestation once the anchor is deep) and splice it
+    in. Returns the (status, headers, body) triple gateway_upgrade returns,
+    with the JSON body _apply_upgrade already parses: pending, or anchored
+    with the upgraded bytes. A proof this adapter cannot walk (a fork
+    marker: several attestation paths, which a proof from one calendar
+    never has) answers status "nonlinear"; an answer that does not splice
+    answers "calendar_answer_rejected"; both land in
+    upgrade_needs_attention with the marker kept."""
+    def answer(obj):
+        return 200, {}, json.dumps(obj).encode()
+
+    try:
+        proof = parse_ots(ots_bytes)
+    except OtsError as exc:
+        return answer({"status": "nonlinear" if "fork" in str(exc) else "invalid",
+                       "bitcoin_anchored": False, "ots": None})
+    if proof.attestation[0] == "bitcoin":
+        return answer({"status": "anchored", "bitcoin_anchored": True,
+                       "ots": base64.b64encode(ots_bytes).decode("ascii")})
+    if proof.attestation[0] != "pending":
+        return answer({"status": "no_attestations", "bitcoin_anchored": False,
+                       "ots": None})
+    status, headers, body = http_get(
+        cfg["calendar_url"] + "/timestamp/" + proof.commitment.hex(), timeout=60)
+    if status == 404:
+        return answer({"status": "pending", "bitcoin_anchored": False,
+                       "ots": base64.b64encode(ots_bytes).decode("ascii")})
+    if status != 200:
+        return status, headers, body
+    try:
+        upgraded = splice_upgrade(ots_bytes, body)
+    except OtsError as exc:
+        log_event(cfg, "calendar_answer_rejected", fp=fp,
+                  reason=str(exc).replace(" ", "_"))
+        return answer({"status": "calendar_answer_rejected",
+                       "bitcoin_anchored": False, "ots": None})
+    return answer({"status": "anchored", "bitcoin_anchored": True,
+                   "ots": base64.b64encode(upgraded).decode("ascii")})
+
+
+def submit_record(cfg, fp):
+    """One submission, by shape: the gateway's /timestamp or the calendar's
+    counted /digest."""
+    if cfg["mode"] == "calendar":
+        return calendar_submit(cfg, fp)
+    return gateway_challenge(cfg, fp)
+
+
+def upgrade_proof(cfg, fp, ots_bytes):
+    """One upgrade ask, by shape: the gateway's /upgrade or the calendar's
+    /timestamp/<commitment>."""
+    if cfg["mode"] == "calendar":
+        return calendar_upgrade(cfg, fp, ots_bytes)
+    return gateway_upgrade(cfg, fp, ots_bytes)
 
 
 def phoenixd_call(cfg, password, endpoint, bolt11, timeout):
@@ -830,6 +1109,16 @@ def buy_one(cfg, password, fp, flags):
 
     sc, age = load_sidecar(sidecar_path(cfg, fp))
     if sc is not None:
+        if cfg["mode"] == "calendar":
+            # A purchase left in flight by a gateway-mode life of this
+            # DATA_DIR. Nothing here can pay or redeem it: the debt waits,
+            # logged once, for the operator to settle or remove the sidecar
+            # (README, "Switching shapes").
+            if fp not in flags["corrupt_logged"]:
+                flags["corrupt_logged"].add(fp)
+                log_event(cfg, "sidecar_needs_attention", fp=fp,
+                          note="left_by_gateway_mode")
+            return True
         return finish_sidecar(cfg, password, fp, sc, age, flags)
 
     verdict, day, spent = _budget_preflight(cfg, flags)
@@ -837,7 +1126,7 @@ def buy_one(cfg, password, fp, flags):
         return verdict == "skip"  # "stop" ends the pass; "skip" keeps the debt
 
     try:
-        status, headers, body = gateway_challenge(cfg, fp)
+        status, headers, body = submit_record(cfg, fp)
     except Unreachable:
         return _mark_down(cfg, flags, "gateway")
     _mark_up(cfg, flags, "gateway")
@@ -868,6 +1157,13 @@ def _buy_challenged(cfg, password, fp, status, headers, body, day, spent, flags)
         flags["retry_at"][0] = time.time() + wait
         log_event(cfg, "rate_limited", wait_secs=wait)
         return False
+    if status == 402 and cfg["mode"] == "calendar":
+        # A calendar never asks for payment: a 402 means CALENDAR_URL points
+        # at a gateway. Refused here, before any payment machinery; the
+        # debt stays.
+        log_event(cfg, "challenge_failed", fp=fp, status=402,
+                  note="calendar_answered_402")
+        return True
     if status != 402:
         log_event(cfg, "challenge_failed", fp=fp, status=status)
         return status != 503  # a paused gateway fails every debt: stop the pass
@@ -983,7 +1279,7 @@ def _buyer_pass_inflight(cfg, password, flags):
                     break
                 if verdict == "skip":
                     continue
-                outstanding[pool.submit(gateway_challenge, cfg, fp)] = (fp, day, spent)
+                outstanding[pool.submit(submit_record, cfg, fp)] = (fp, day, spent)
             if not outstanding:
                 break
             done, _ = wait_futures(outstanding, return_when=FIRST_COMPLETED)
@@ -1128,7 +1424,7 @@ def upgrade_pass(cfg, flags):
                     pending_clear(cfg, fp)  # finished by an earlier pass
                     continue
                 checked += 1
-                outstanding[pool.submit(gateway_upgrade, cfg, fp, data)] = (fp, path)
+                outstanding[pool.submit(upgrade_proof, cfg, fp, data)] = (fp, path)
             if not outstanding:
                 break
             done, _ = wait_futures(outstanding, return_when=FIRST_COMPLETED)
@@ -1310,7 +1606,9 @@ def main():
     os.umask(0o077)
     try:
         cfg = resolve_config(os.environ)
-        password = read_phoenix_password(cfg["phoenix_conf"])
+        # The appliance shape pays nothing: no phoenixd, no password in memory.
+        password = (read_phoenix_password(cfg["phoenix_conf"])
+                    if cfg["mode"] == "gateway" else None)
         os.makedirs(cfg["debts_dir"], exist_ok=True)
         os.makedirs(cfg["proofs_dir"], exist_ok=True)
         os.makedirs(cfg["pending_dir"], exist_ok=True)
@@ -1331,6 +1629,7 @@ def main():
 
     log_event(cfg, "startup",
               listen=f"{cfg['listen_host']}:{cfg['listen_port']}",
+              mode=cfg["mode"],
               max_price_sats=cfg["max_price_sats"],
               daily_budget_sats=cfg["daily_budget_sats"],
               poll_secs=cfg["poll_secs"],

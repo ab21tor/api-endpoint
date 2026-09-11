@@ -7,6 +7,21 @@ OpenTimestamps proof from an L402 timestamp gateway, paid via the payer
 phoenixd. The client system never sees an invoice, a macaroon, or a
 preimage: it POSTs bytes and, later, a proof file exists.
 
+Two shapes, one door, chosen by which URL is set:
+
+- **Hosted** (`GATEWAY_URL`): the proof comes from an L402 timestamp
+  gateway — bought through the 402 flow, or handed over by the gateway's
+  free door — and the standing payer (`auto-anchor`) settles the anchor
+  bills. The gateway and the payer are the `timestamp-gateway` and
+  `auto-anchor` repos.
+- **Appliance** (`CALENDAR_URL`): the box runs its own calendar (the
+  `opentimestamps-server` fork, `docker-compose.enterprise.yml`) and this
+  adapter submits to it directly — the calendar's counted `/digest` — with
+  no gateway, no Lightning, no payment anywhere. Everything after the
+  transport is the same code: the debt before "received", the pending
+  index, `INFLIGHT`, the crash paths, the wrong-digest refusal. Section
+  "The appliance shape" below.
+
 One route. Everything else is the filesystem.
 
 ## The one route
@@ -42,24 +57,76 @@ Precedence: invocation env > `.env` beside the script > defaults.
 | Knob | Default | Meaning |
 |---|---|---|
 | `LISTEN_ADDR` | (required) | host:port of the door, e.g. `127.0.0.1:8402` |
-| `GATEWAY_URL` | (required) | the L402 timestamp gateway |
+| `GATEWAY_URL` | one of the two | hosted shape: the L402 timestamp gateway this box buys proofs from (paid or free door) |
+| `CALENDAR_URL` | one of the two | appliance shape: the box's own calendar, e.g. `http://127.0.0.1:14788`. Exactly one of `GATEWAY_URL` and `CALENDAR_URL` is set; both or neither is a startup error naming both |
 | `MAX_PRICE_SATS` | 5000 | refuse any single quote above this |
 | `DAILY_BUDGET_SATS` | 200000 | refuse to exceed this per UTC day |
 | `PHOENIXD_URL` | `http://127.0.0.1:9740` | payer phoenixd |
 | `PHOENIX_CONF` | `~/.phoenix/phoenix.conf` | http-password source |
 | `DATA_DIR` | script's directory | where the filesystem API lives |
 | `POLL_SECS` | 2 | buyer pass cadence |
-| `UPGRADE_SECS` | 600 | upgrader pass cadence (slow, free) |
+| `UPGRADE_SECS` | 600 hosted, 3600 appliance | upgrader pass cadence (slow, free; on the appliance each pass is one loopback GET per pending proof) |
 | `HEARTBEAT_SECS` | 10 | heartbeat cadence |
 | `L402_EXPIRY_SECS` | 3600 | age past which an unpaid in-flight challenge is abandoned and re-challenged, loudly |
 | `CIRCUIT_BREAKER_FAILURES` | 5 | consecutive payment failures before purchasing pauses |
 | `CIRCUIT_BREAKER_PAUSE_SECS` | 60 | initial pause; doubles per failed probe, capped at 3600 |
-| `INFLIGHT` | 1 | gateway submissions the buyer may hold in the air at once (strict positive int); 1 = the serial pass |
+| `INFLIGHT` | 1 hosted, 8 appliance | submissions the buyer may hold in the air at once (strict positive int); 1 = the serial pass |
 | `UPGRADE_INFLIGHT` | = `INFLIGHT` | `/upgrade` calls the upgrader may hold in the air at once (strict positive int) |
 | `GATEWAY_UPGRADE_TOKEN` | (unset) | the gateway's `UPGRADE_CLIENT_TOKEN`, presented as a bearer on `/upgrade` so this client is not throttled by the gateway's per-peer verify budget (30 a minute by default — a free door hands out far more than that); unset = anonymous, throttled |
 | `REDEEM_ATTEMPTS_MAX` | 300 | definite refusals of a paid preimage (every pass) before the sidecar is marked needs-attention |
 | `REDEEM_ATTENTION_RETRY_SECS` | 3600 | how often a needs-attention sidecar is retried after that |
 | `LOG_CAP_BYTES` | 16777216 | once `log` reaches this many bytes the next event renames it to `log.1` (replacing any previous `.1`) and starts fresh; 0 = never rotate |
+
+In the appliance shape the payment knobs — `PHOENIXD_URL`, `PHOENIX_CONF`,
+`MAX_PRICE_SATS`, `DAILY_BUDGET_SATS`, `L402_EXPIRY_SECS`, the breaker, the
+redeem ceilings, `GATEWAY_UPGRADE_TOKEN` — are parsed as usual and never
+used: `phoenix.conf` is not read, no password is held, the ledger and the
+`.l402` sidecars are never written.
+
+## The appliance shape
+
+With `CALENDAR_URL` set the buyer POSTs each fingerprint's 32 raw digest
+bytes to the calendar's counted door, `POST /digest` — never the operator
+lane, `/operator/digest`, which is the self-stamper's and is not a record —
+so every record this box submits lands in the calendar's `journal.counts`
+sidecar, in the receipt's `records` field, and therefore in the box's
+logbook. The calendar answers the serialized pending timestamp; the adapter
+prefixes the detached-file header (magic, version, the sha256 op, the
+digest) and stores the result exactly as a free-door answer: the same
+`proof_digest` check, the same pending marker, the same atomic write,
+`clear_debt`, `proof_free`. The bytes are what the `ots` client writes for a
+single calendar; the parser that builds and later upgrades them is a copy of
+the one in the fork's `ops/selfstamp.py`, cross-checked against the
+opentimestamps library by both trees' tests.
+
+The upgrader walks each pending proof to its commitment and asks
+`GET /timestamp/<commitment>`: 404 while the anchor is not yet deep, the
+path to the Bitcoin attestation once it is, spliced in at the attestation
+marker and written only when the result is a linear proof of the same
+digest (`_apply_upgrade`'s refusal, the marker clear and the `anchored`
+event are unchanged). A proof the adapter cannot walk — a fork marker, which
+a proof from one calendar never has — is logged
+`upgrade_needs_attention status=nonlinear` with its marker kept.
+
+Answers that are not the protocol are refused and the debt stays: a 402
+(the URL points at a gateway) is `challenge_failed … note=calendar_answered_402`
+and touches no payment machinery; a 200 that is not a pending timestamp of
+this digest is `calendar_answer_rejected`; a 503 (the calendar's aggregator
+wedged or gone) ends the pass as a gateway 503 does. There is no rate
+limiter on this path: `LISTEN_ADDR` is the door's only guard, exactly as on
+the hosted free door, and `INFLIGHT` sets records per second (the calendar
+commits one round a second; each submission waits for its round).
+
+**Switching shapes.** A `DATA_DIR` that lived on the hosted shape can hold
+in-flight purchases (`debts/<fp>.l402`); in the appliance shape nothing can
+pay or redeem them, so such a debt is skipped, logged once
+(`sidecar_needs_attention … note=left_by_gateway_mode`), and waits for the
+operator to settle it on the old shape or remove the sidecar.
+
+Unit and env for the appliance: `deploy/api-endpoint.service` (a user unit)
+and `deploy/api-endpoint.env.example`. The whole install — bitcoind, the
+calendar, this adapter, the self-stamper, the watcher — is the fork README's
+"The appliance shape".
 
 ## Money rules
 
@@ -152,10 +219,12 @@ it now deletes the `attention` key from the sidecar.
 ## Running it
 
 ```bash
-LISTEN_ADDR=127.0.0.1:8402 GATEWAY_URL=http://... python3 api_endpoint.py
+LISTEN_ADDR=127.0.0.1:8402 GATEWAY_URL=http://... python3 api_endpoint.py    # hosted
+LISTEN_ADDR=127.0.0.1:8402 CALENDAR_URL=http://127.0.0.1:14788 DATA_DIR=... python3 api_endpoint.py   # appliance
 ```
 
-The suite (41 tests, no network, no phoenixd):
+The suite (51 tests, no network, no phoenixd, no calendar — both are faked
+in-process):
 
 ```bash
 python3 -m unittest test_api_endpoint -v
@@ -182,7 +251,31 @@ rotation to it entirely. Proven by `test_log_rotates_to_dot1_at_cap_and_replaces
 
 ## Claims, labelled
 
-Proven by the 41-test suite and the live smoke: the door contract
+Proven for the appliance shape (2026-09-11, against a fake calendar speaking
+the fork's protocol): exactly one of the two URLs, and the appliance
+defaults, `test_calendar_mode_config_exactly_one_url`; every submission is
+the 32 raw digest bytes to the counted `/digest` and the stored proof is the
+header plus the calendar's answer,
+`test_calendar_mode_submits_raw_digest_to_counted_digest_path`; no
+`phoenix.conf`, no phoenixd call, no ledger, no sidecar,
+`test_calendar_mode_never_reads_phoenix_or_writes_ledger_or_sidecar`; a 402,
+a 503 and a non-protocol 200 each keep the debt and pay nothing,
+`test_calendar_mode_402_is_refused_without_payment`,
+`test_calendar_mode_503_stops_the_pass_and_keeps_the_debt`,
+`test_calendar_mode_garbage_answer_keeps_debt`; the upgrade stays pending on
+404, splices the Bitcoin path once mined, keeps the digest, clears the
+marker and never asks again,
+`test_calendar_mode_upgrade_404_stays_pending_then_anchored_bytes_spliced`;
+a non-linear proof keeps its marker,
+`test_calendar_mode_nonlinear_proof_needs_attention_keeps_marker`;
+`INFLIGHT=8` overlaps for real and never holds one fingerprint twice,
+`test_calendar_mode_inflight_eight_hits_digest_once_per_fingerprint`; the
+proof bytes round-trip through the opentimestamps library where it is
+importable, `test_ots_parser_cross_checks_with_the_library`. **Unproven: the
+appliance shape against a live calendar and a live anchor cycle** — the
+first appliance install is that witness.
+
+Proven by the 51-test suite and the live smoke: the door contract
 (including 411/400/405 refusals and the durable-debt-before-received
 ordering), the budget/breaker/ledger rules, anchored-vs-pending detection
 against real fixture proofs, the `INFLIGHT` pins listed above, and one
@@ -202,7 +295,9 @@ on the slow retry (`test_ceiling_marks_attention_once_and_keeps_the_preimage`,
 `test_at_the_ceiling_the_retry_is_slow_and_a_fixed_gateway_heals_it`,
 `test_503_counts_nothing`).
 
-**Unproven: the live anchored upgrade end-to-end (the upgrader has only
-been proven against fixtures, not a live anchor cycle), sustained volume,
-long-horizon breaker behaviour against a real gateway outage, and restart
-with a large debt backlog.**
+**Proven on the hosted shape, 2026-09-09 on pi5: the live anchored upgrade
+end-to-end — 2.7 million pending proofs upgraded against the live gateway
+and its calendar, the backlog draining at about 150 proofs a second.
+Unproven: sustained volume on the paid door, long-horizon breaker
+behaviour against a real gateway outage, and restart with a large debt
+backlog.**

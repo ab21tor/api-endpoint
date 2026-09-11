@@ -395,6 +395,169 @@ class FreeDoorGateway(FakeGateway):
                 self.inflight_total -= 1
 
 
+# fake calendar (the appliance shape's counterpart to FakeGateway)
+CAL_PENDING_TAG = bytes.fromhex("83dfe30d2ef90c8e")
+CAL_BITCOIN_TAG = bytes.fromhex("0588960d73d71901")
+CAL_NONCE = b"\x11" * 16
+CAL_IDX = b"\x65\x53\xf1\x00"          # a 4-byte big-endian unix second
+CAL_MAC = b"\x22" * 8
+CAL_SIBLING = b"\x33" * 32
+CAL_URI = "http://127.0.0.1:14788/"
+
+
+def cal_vu(n):
+    """Independent varuint encoder so the service's is checked, not echoed."""
+    out = bytearray()
+    while True:
+        byte = n & 0x7F
+        n >>= 7
+        if n:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def cal_vb(b):
+    return cal_vu(len(b)) + b
+
+
+def cal_pending_response(digest):
+    """What the fork's calendar answers to POST /digest: append nonce,
+    sha256, prepend the second, append the mac, then a pending attestation
+    naming the calendar uri. Returns (bytes, commitment)."""
+    commitment = CAL_IDX + hashlib.sha256(digest + CAL_NONCE).digest() + CAL_MAC
+    body = (b"\xf0" + cal_vb(CAL_NONCE) + b"\x08" + b"\xf1" + cal_vb(CAL_IDX)
+            + b"\xf0" + cal_vb(CAL_MAC)
+            + b"\x00" + CAL_PENDING_TAG + cal_vb(cal_vb(CAL_URI.encode())))
+    return body, commitment
+
+
+def cal_bitcoin_response(height):
+    """What GET /timestamp/<commitment> answers once the anchor is deep."""
+    return (b"\xf0" + cal_vb(CAL_SIBLING) + b"\x08"
+            + b"\x00" + CAL_BITCOIN_TAG + cal_vb(cal_vu(height)))
+
+
+class FakeCalendar:
+    """Speaks the fork's calendar protocol (otsserver/rpc.py): POST /digest
+    and POST /operator/digest take raw digest bytes and answer the serialized
+    pending timestamp; GET /timestamp/<hex> answers 404 while pending and the
+    Bitcoin path once mined. It records every path served and every body it
+    received, and measures how many submissions it holds in the air per
+    digest and in total, so a test can pin once-per-fingerprint while proving
+    the concurrency was real. Knobs: mined_height; answer (None, 402, 503 or
+    "garbage"); delay (seconds each POST is held open)."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.paths = []
+        self.received = []
+        self.known = set()
+        self.mined_height = None
+        self.answer = None
+        self.delay = 0.0
+        self.gets = 0
+        self.get_paths = []
+        self.inflight = {}
+        self.max_inflight_fp = 0
+        self.inflight_total = 0
+        self.max_inflight_total = 0
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def _raw(self, code, body, headers=None):
+                self.send_response(code)
+                for k, v in (headers or {}).items():
+                    self.send_header(k, v)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except OSError:
+                    pass
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                digest = self.rfile.read(n)
+                with outer.lock:
+                    outer.paths.append(self.path)
+                    outer.received.append(digest)
+                    outer.inflight[digest] = outer.inflight.get(digest, 0) + 1
+                    outer.max_inflight_fp = max(outer.max_inflight_fp, outer.inflight[digest])
+                    outer.inflight_total += 1
+                    outer.max_inflight_total = max(outer.max_inflight_total,
+                                                   outer.inflight_total)
+                    answer = outer.answer
+                try:
+                    if outer.delay:
+                        time.sleep(outer.delay)
+                    if self.path not in ("/digest", "/operator/digest"):
+                        self._raw(404, b"not found", {"Content-Type": "text/plain"})
+                        return
+                    if answer == 402:
+                        # A misconfigured CALENDAR_URL pointing at a gateway.
+                        self._raw(402, b'{"detail": "payment required"}',
+                                  {"WWW-Authenticate":
+                                   'L402 macaroon="tok", invoice="lnfake:21:x:1"'})
+                        return
+                    if answer == 503:
+                        self._raw(503, b"aggregator unavailable",
+                                  {"Content-Type": "text/plain", "Retry-After": "5"})
+                        return
+                    if answer == "garbage":
+                        self._raw(200, b"<html>not a timestamp</html>",
+                                  {"Content-Type": "text/html"})
+                        return
+                    body, commitment = cal_pending_response(digest)
+                    with outer.lock:
+                        outer.known.add(commitment)
+                    self._raw(200, body, {"Content-Type": "application/octet-stream"})
+                finally:
+                    with outer.lock:
+                        outer.inflight[digest] -= 1
+                        outer.inflight_total -= 1
+
+            def do_GET(self):
+                with outer.lock:
+                    outer.gets += 1
+                    outer.get_paths.append(self.path)
+                    mined = outer.mined_height
+                if not self.path.startswith("/timestamp/"):
+                    self._raw(404, b"not found", {"Content-Type": "text/plain"})
+                    return
+                try:
+                    commitment = bytes.fromhex(self.path[len("/timestamp/"):])
+                except ValueError:
+                    self._raw(400, b"commitment must be hex-encoded bytes",
+                              {"Content-Type": "text/plain"})
+                    return
+                with outer.lock:
+                    known = commitment in outer.known
+                if not known:
+                    self._raw(404, b"Not found", {"Content-Type": "text/plain"})
+                    return
+                if mined is None:
+                    self._raw(404, b"Pending confirmation in Bitcoin blockchain",
+                              {"Content-Type": "text/plain"})
+                    return
+                self._raw(200, cal_bitcoin_response(mined),
+                          {"Content-Type": "application/octet-stream"})
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        self.url = f"http://127.0.0.1:{self.port}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def shutdown(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
 # service subprocess runner
 class ServiceRunner:
     def __init__(self, base_dir, env):
@@ -1648,3 +1811,275 @@ class TestLogRotation(unittest.TestCase):
             with self.assertRaises(api_endpoint.ConfigError, msg=repr(bad)) as cm:
                 self.cfg(bad)
             self.assertIn("LOG_CAP_BYTES", str(cm.exception))
+
+
+# The appliance shape: CALENDAR_URL instead of GATEWAY_URL. The service
+# submits each fingerprint to the calendar's counted /digest, builds the
+# detached proof itself, and upgrades through GET /timestamp/<commitment>.
+# No L402, no phoenixd, no ledger, no sidecar; INFLIGHT, the pending index,
+# the crash paths and the wrong-digest refusal are the same code as the
+# gateway shape.
+class TestCalendarModeConfig(unittest.TestCase):
+    def test_calendar_mode_config_exactly_one_url(self):
+        base = {"LISTEN_ADDR": "127.0.0.1:8402"}
+        with tempfile.TemporaryDirectory() as d:
+            with self.assertRaises(api_endpoint.ConfigError) as cm:
+                api_endpoint.resolve_config(
+                    {**base, "GATEWAY_URL": "http://x", "CALENDAR_URL": "http://y"},
+                    script_dir=d)
+            self.assertIn("GATEWAY_URL", str(cm.exception))
+            self.assertIn("CALENDAR_URL", str(cm.exception))
+            with self.assertRaises(api_endpoint.ConfigError) as cm:
+                api_endpoint.resolve_config(base, script_dir=d)
+            self.assertIn("GATEWAY_URL", str(cm.exception))
+            self.assertIn("CALENDAR_URL", str(cm.exception))
+
+            cal = api_endpoint.resolve_config(
+                {**base, "CALENDAR_URL": "http://127.0.0.1:14788/"}, script_dir=d)
+            self.assertEqual(cal["mode"], "calendar")
+            self.assertEqual(cal["calendar_url"], "http://127.0.0.1:14788")
+            self.assertIsNone(cal["gateway_url"])
+            # The appliance defaults (ruling 2026-09-11): eight in flight, one
+            # upgrade pass an hour.
+            self.assertEqual(cal["inflight"], 8)
+            self.assertEqual(cal["upgrade_inflight"], 8)
+            self.assertEqual(cal["upgrade_secs"], 3600.0)
+
+            gw = api_endpoint.resolve_config({**base, "GATEWAY_URL": "http://x"},
+                                             script_dir=d)
+            self.assertEqual(gw["mode"], "gateway")
+            self.assertIsNone(gw["calendar_url"])
+            self.assertEqual(gw["inflight"], 1)
+            self.assertEqual(gw["upgrade_secs"], 600.0)
+
+            explicit = api_endpoint.resolve_config(
+                {**base, "CALENDAR_URL": "http://y", "INFLIGHT": "3",
+                 "UPGRADE_SECS": "7"}, script_dir=d)
+            self.assertEqual(explicit["inflight"], 3)
+            self.assertEqual(explicit["upgrade_inflight"], 3)
+            self.assertEqual(explicit["upgrade_secs"], 7.0)
+
+
+class TestOtsParser(unittest.TestCase):
+    def test_ots_parser_cross_checks_with_the_library(self):
+        digest = hashlib.sha256(b"a record").digest()
+        body, commitment = cal_pending_response(digest)
+        ots = api_endpoint.build_ots(digest, body)
+        self.assertEqual(ots, OTS_HEAD + digest + body)
+        proof = api_endpoint.parse_ots(ots)
+        self.assertEqual(proof.digest, digest)
+        self.assertEqual(proof.commitment, commitment)
+        self.assertEqual(proof.attestation, ("pending", CAL_URI))
+        self.assertEqual(api_endpoint.proof_digest(ots), digest.hex())
+        self.assertFalse(api_endpoint.is_anchored(ots))
+
+        upgraded = api_endpoint.splice_upgrade(ots, cal_bitcoin_response(965446))
+        up = api_endpoint.parse_ots(upgraded)
+        self.assertEqual(up.digest, digest)
+        self.assertEqual(up.attestation, ("bitcoin", 965446))
+        self.assertTrue(api_endpoint.is_anchored(upgraded))
+        self.assertEqual(upgraded[:proof.ops_end], ots[:proof.ops_end])
+
+        with self.assertRaises(api_endpoint.OtsError):
+            api_endpoint.parse_ots(b"not a proof")
+        with self.assertRaises(api_endpoint.OtsError) as cm:
+            api_endpoint.parse_ots(OTS_HEAD + digest + b"\xff" + body)
+        self.assertIn("fork", str(cm.exception))
+        with self.assertRaises(api_endpoint.OtsError):
+            api_endpoint.splice_upgrade(upgraded, cal_bitcoin_response(1))
+
+        try:
+            from opentimestamps.core.serialize import StreamDeserializationContext
+            from opentimestamps.core.timestamp import DetachedTimestampFile
+            from opentimestamps.core.notary import BitcoinBlockHeaderAttestation
+        except ImportError:
+            self.skipTest("opentimestamps library not importable here")
+        import io
+        for raw in (ots, upgraded):
+            detached = DetachedTimestampFile.deserialize(
+                StreamDeserializationContext(io.BytesIO(raw)))
+            self.assertEqual(detached.file_digest, digest)
+        attestations = [a for _, a in detached.timestamp.all_attestations()]
+        self.assertEqual(len(attestations), 1)
+        self.assertIsInstance(attestations[0], BitcoinBlockHeaderAttestation)
+        self.assertEqual(attestations[0].height, 965446)
+
+
+class CalendarBase(IntegrationBase):
+    def setUp(self):
+        super().setUp()
+        self.cal = FakeCalendar()
+
+    def tearDown(self):
+        self.cal.shutdown()
+        super().tearDown()
+
+    def make_calendar_env(self, **over):
+        env = self.make_env(**over)
+        env.pop("GATEWAY_URL", None)
+        env["CALENDAR_URL"] = self.cal.url
+        return env
+
+    def start_calendar_service(self, **over):
+        self.runner = ServiceRunner(self.tmp, self.make_calendar_env(**over))
+        self.runner.start()
+        return self.runner
+
+    def pending_file(self, fp):
+        return self.data("pending", fp)
+
+    def post_and_wait(self, body, timeout=20):
+        fp = hashlib.sha256(body).hexdigest()
+        status, reply = post_record(self.runner, body)
+        self.assertEqual((status, reply.strip()), (200, "received " + fp))
+        self.wait_until(lambda: os.path.exists(self.proof_file(fp))
+                        and not os.path.exists(self.debt_file(fp)),
+                        timeout=timeout, what=f"proof for {fp[:12]}")
+        return fp
+
+
+class TestCalendarMode(CalendarBase):
+    def test_calendar_mode_submits_raw_digest_to_counted_digest_path(self):
+        self.start_calendar_service(INFLIGHT=1)
+        body = b"record one"
+        fp = self.post_and_wait(body)
+        digest = bytes.fromhex(fp)
+        # Every submission went to the counted door, never the operator lane,
+        # and carried exactly the 32 raw digest bytes.
+        self.assertEqual(self.cal.paths, ["/digest"])
+        self.assertEqual(self.cal.received, [digest])
+        with open(self.proof_file(fp), "rb") as f:
+            data = f.read()
+        self.assertEqual(data, OTS_HEAD + digest + cal_pending_response(digest)[0])
+        self.assertEqual(api_endpoint.proof_digest(data), fp)
+        self.assertFalse(api_endpoint.is_anchored(data))
+        self.assertTrue(os.path.exists(self.pending_file(fp)))
+        self.assertIn(f" proof_free fp={fp}", self.read_service_log())
+
+    def test_calendar_mode_never_reads_phoenix_or_writes_ledger_or_sidecar(self):
+        self.start_calendar_service(
+            INFLIGHT=1, PHOENIX_CONF=os.path.join(self.tmp, "no-such-phoenix.conf"))
+        fp = self.post_and_wait(b"record two")
+        self.assertEqual(self.ln.decode_calls, [])
+        self.assertEqual(self.ln.pay_calls, [])
+        self.assertEqual(self.ln.auth_failures, 0)
+        self.assertFalse(os.path.exists(self.data("ledger")))
+        self.assertEqual([n for n in os.listdir(self.data("debts")) if n.endswith(".l402")], [])
+        self.wait_until(lambda: os.path.exists(self.data("heartbeat")), what="heartbeat")
+        with open(self.data("heartbeat")) as f:
+            self.assertIn("breaker=ok", f.read())
+        self.assertIn("mode=calendar", self.read_service_log())
+        self.assertNotIn(fp, "")  # fp used above; keeps the name meaningful
+
+    def test_calendar_mode_402_is_refused_without_payment(self):
+        self.cal.answer = 402
+        self.start_calendar_service(INFLIGHT=1)
+        body = b"record three"
+        fp = hashlib.sha256(body).hexdigest()
+        post_record(self.runner, body)
+        self.wait_until(lambda: f"challenge_failed fp={fp} status=402 note=calendar_answered_402"
+                        in self.read_service_log(), what="the 402 refusal")
+        self.assertTrue(os.path.exists(self.debt_file(fp)))
+        self.assertFalse(os.path.exists(self.sidecar_file(fp)))
+        self.assertFalse(os.path.exists(self.proof_file(fp)))
+        self.assertEqual(self.ln.pay_calls, [])
+        self.assertEqual(self.ln.decode_calls, [])
+        self.cal.answer = None
+        self.wait_until(lambda: os.path.exists(self.proof_file(fp)), what="proof after recovery")
+        self.assertEqual(self.ln.pay_calls, [])
+
+    def test_calendar_mode_503_stops_the_pass_and_keeps_the_debt(self):
+        self.cal.answer = 503
+        self.start_calendar_service(INFLIGHT=1)
+        fps = [hashlib.sha256(b).hexdigest() for b in (b"r4a", b"r4b")]
+        for b in (b"r4a", b"r4b"):
+            post_record(self.runner, b)
+        self.wait_until(lambda: "challenge_failed" in self.read_service_log()
+                        and "status=503" in self.read_service_log(), what="the 503")
+        time.sleep(0.5)
+        for fp in fps:
+            self.assertTrue(os.path.exists(self.debt_file(fp)))
+            self.assertFalse(os.path.exists(self.proof_file(fp)))
+        self.cal.answer = None
+        for fp in fps:
+            self.wait_until(lambda fp=fp: os.path.exists(self.proof_file(fp))
+                            and not os.path.exists(self.debt_file(fp)),
+                            what="proofs after the calendar recovers")
+        self.assertEqual(set(self.cal.paths), {"/digest"})
+
+    def test_calendar_mode_garbage_answer_keeps_debt(self):
+        self.cal.answer = "garbage"
+        self.start_calendar_service(INFLIGHT=1)
+        body = b"record five"
+        fp = hashlib.sha256(body).hexdigest()
+        post_record(self.runner, body)
+        self.wait_until(lambda: f"calendar_answer_rejected fp={fp}" in self.read_service_log(),
+                        what="the rejected answer")
+        self.assertTrue(os.path.exists(self.debt_file(fp)))
+        self.assertFalse(os.path.exists(self.proof_file(fp)))
+        self.cal.answer = None
+        self.wait_until(lambda: os.path.exists(self.proof_file(fp)), what="proof after recovery")
+
+    def test_calendar_mode_upgrade_404_stays_pending_then_anchored_bytes_spliced(self):
+        self.start_calendar_service(INFLIGHT=1, UPGRADE_SECS=0.2)
+        fp = self.post_and_wait(b"record six")
+        with open(self.proof_file(fp), "rb") as f:
+            original = f.read()
+        commitment = api_endpoint.parse_ots(original).commitment
+        self.wait_until(lambda: f"/timestamp/{commitment.hex()}" in self.cal.get_paths,
+                        what="an upgrade GET for the commitment")
+        time.sleep(0.5)
+        self.assertTrue(os.path.exists(self.pending_file(fp)))
+        self.assertNotIn(f" anchored fp={fp}", self.read_service_log())
+        with open(self.proof_file(fp), "rb") as f:
+            self.assertEqual(f.read(), original)
+
+        self.cal.mined_height = 965446
+        self.wait_until(lambda: not os.path.exists(self.pending_file(fp)),
+                        what="the marker to clear")
+        with open(self.proof_file(fp), "rb") as f:
+            data = f.read()
+        ops_end = api_endpoint.parse_ots(original).ops_end
+        self.assertEqual(data, original[:ops_end] + cal_bitcoin_response(965446))
+        self.assertEqual(api_endpoint.proof_digest(data), fp)
+        self.assertTrue(api_endpoint.is_anchored(data))
+        self.assertIn(f" anchored fp={fp}", self.read_service_log())
+        gets = self.cal.gets
+        time.sleep(0.8)
+        self.assertEqual(self.cal.gets, gets)  # a complete proof is never asked about again
+
+    def test_calendar_mode_nonlinear_proof_needs_attention_keeps_marker(self):
+        self.start_calendar_service(INFLIGHT=1, UPGRADE_SECS=0.2)
+        fp = hashlib.sha256(b"a proof from somewhere else").hexdigest()
+        body, _ = cal_pending_response(bytes.fromhex(fp))
+        foreign = OTS_HEAD + bytes.fromhex(fp) + b"\xff" + body
+        with open(self.proof_file(fp), "wb") as f:
+            f.write(foreign)
+        with open(self.pending_file(fp), "wb"):
+            pass
+        self.wait_until(lambda: f"upgrade_needs_attention fp={fp} status=nonlinear"
+                        in self.read_service_log(), what="the nonlinear refusal")
+        self.assertTrue(os.path.exists(self.pending_file(fp)))
+        with open(self.proof_file(fp), "rb") as f:
+            self.assertEqual(f.read(), foreign)
+        self.assertEqual(self.cal.gets, 0)
+
+    def test_calendar_mode_inflight_eight_hits_digest_once_per_fingerprint(self):
+        self.cal.delay = 0.3
+        self.start_calendar_service(INFLIGHT=8)
+        bodies = [b"burst %d" % i for i in range(16)]
+        fps = [hashlib.sha256(b).hexdigest() for b in bodies]
+        for b in bodies:
+            self.assertEqual(post_record(self.runner, b)[0], 200)
+        for fp in fps:
+            self.wait_until(lambda fp=fp: os.path.exists(self.proof_file(fp))
+                            and not os.path.exists(self.debt_file(fp)),
+                            timeout=40, what="all sixteen proofs")
+        self.assertGreaterEqual(self.cal.max_inflight_total, 2)  # the overlap was real
+        self.assertEqual(self.cal.max_inflight_fp, 1)              # never twice at once
+        self.assertEqual(set(self.cal.paths), {"/digest"})
+        self.assertEqual(sorted(self.cal.received), sorted(bytes.fromhex(fp) for fp in fps))
+        self.assertEqual(len(self.cal.received), 16)
+        for fp in fps:
+            with open(self.proof_file(fp), "rb") as f:
+                self.assertEqual(api_endpoint.proof_digest(f.read()), fp)

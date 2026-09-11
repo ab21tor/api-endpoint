@@ -1,0 +1,24 @@
+# api-endpoint on the appliance shape: the POST /record door, proofs from the
+# box's own calendar (CALENDAR_URL). A user unit (systemctl --user; the
+# operator account needs `loginctl enable-linger <user>` so it runs without a
+# login session). The code lives in the clone (read-only on the box, -B
+# writes no __pycache__); config and state live under ~/appliance. Paths
+# assume the clone at ~/api-endpoint; edit if not.
+#   mkdir -p ~/appliance && cp deploy/api-endpoint.env.example ~/appliance/api-endpoint.env
+#   cp deploy/api-endpoint.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+#   systemctl --user enable --now api-endpoint.service
+[Unit]
+Description=api-endpoint: POST /record door, proofs from the box's own calendar
+
+[Service]
+Type=simple
+EnvironmentFile=%h/appliance/api-endpoint.env
+ExecStart=/usr/bin/python3 -B %h/api-endpoint/api_endpoint.py
+WorkingDirectory=%h/appliance
+StandardOutput=append:%h/appliance/api-endpoint.stderr.log
+StandardError=append:%h/appliance/api-endpoint.stderr.log
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
