@@ -43,9 +43,13 @@ HEX64_ANYCASE = re.compile(r"[0-9a-fA-F]{64}")
 
 # OpenTimestamps serialization constants. A detached proof always begins with
 # HEADER_MAGIC, and an attestation is serialized as a 0x00 marker byte
-# followed by its 8-byte type tag — so "\x00 + bitcoin tag" in the bytes
-# means the proof carries a Bitcoin block-header attestation: anchored.
-# Checked against a real anchored proof and a real pending proof in the tests.
+# followed by its 8-byte type tag. Whether a proof carries a Bitcoin
+# block-header attestation is decided by deserialising the whole proof and
+# inspecting its attestation nodes (inspect_proof), never by scanning the
+# bytes for the tag: a chosen digest or an operand can contain those nine
+# bytes (2026-09-15 review, "structural parsing is called Bitcoin
+# verification"). Checked against a real anchored proof and a real pending
+# proof in the tests.
 OTS_MAGIC = b"\x00OpenTimestamps\x00\x00Proof\x00\xbf\x89\xe2\xe8\x84\xe8\x92\x94"
 BITCOIN_TAG = bytes.fromhex("0588960d73d71901")
 BITCOIN_ATTESTATION = b"\x00" + BITCOIN_TAG
@@ -188,6 +192,107 @@ def splice_upgrade(ots, calendar_response):
     if new.digest != proof.digest:
         raise OtsError("digest changed by the upgrade")
     return upgraded
+
+
+# The structural states of a proof on disk. None of them is verification:
+# "verified" would mean the path from the digest was replayed to a merkle
+# root and that root checked against the Bitcoin block header, which this
+# adapter never does (the fork's claim kit and the ots client do).
+BITCOIN_ATTESTATION_PRESENT = "bitcoin_attestation_present"   # an attestation node names a Bitcoin block
+PENDING = "pending"                                           # only pending attestations: a calendar is still owed
+INVALID = "invalid"                                           # not a whole proof, or not of this fingerprint
+
+
+def _walk_timestamp(data, pos, out):
+    """One timestamp: zero or more fork-marked branches, then a last branch."""
+    while True:
+        if pos >= len(data):
+            raise OtsError("truncated: no attestation")
+        if data[pos] == FORK_MARKER:
+            pos = _walk_branch(data, pos + 1, out)
+            continue
+        return _walk_branch(data, pos, out)
+
+
+def _walk_branch(data, pos, out):
+    tag = data[pos]
+    pos += 1
+    if tag == ATTESTATION_MARKER:
+        atag = data[pos:pos + 8]
+        if len(atag) != 8:
+            raise OtsError("truncated attestation tag")
+        pos += 8
+        payload, pos = read_varbytes(data, pos)
+        if atag == PENDING_TAG:
+            uri, _ = read_varbytes(payload, 0)
+            out.append(("pending", uri.decode("utf-8", "replace")))
+        elif atag == BITCOIN_TAG:
+            height, _ = read_varuint(payload, 0)
+            out.append(("bitcoin", height))
+        else:
+            out.append(("unknown", atag.hex()))
+        return pos
+    if tag == OP_SHA256:
+        pass
+    elif tag in (OP_APPEND, OP_PREPEND):
+        _, pos = read_varbytes(data, pos)
+    else:
+        raise OtsError("unsupported op 0x%02x" % tag)
+    return _walk_timestamp(data, pos, out)
+
+
+def proof_attestations(data):
+    """Every attestation node of a detached proof, forks included (a proof
+    the gateway upgraded keeps its pending attestation beside the Bitcoin
+    path), once the whole file has been walked: (digest hex, [(kind,
+    value), ...]). Raises OtsError on anything that is not one complete
+    proof: bad magic, an unknown op, truncation, trailing bytes."""
+    if data[:len(OTS_MAGIC)] != OTS_MAGIC:
+        raise OtsError("not an OpenTimestamps proof (bad magic)")
+    pos = len(OTS_MAGIC)
+    version, pos = read_varuint(data, pos)
+    if version != OTS_VERSION:
+        raise OtsError("unsupported proof version %d" % version)
+    if pos >= len(data) or data[pos] != OP_SHA256:
+        raise OtsError("file hash op is not sha256")
+    pos += 1
+    digest = data[pos:pos + 32]
+    if len(digest) != 32:
+        raise OtsError("truncated digest")
+    pos += 32
+    out = []
+    end = _walk_timestamp(data, pos, out)
+    if end != len(data):
+        raise OtsError("trailing bytes after the proof")
+    return digest.hex(), out
+
+
+def inspect_proof(data, fp=None):
+    """(state, reason) for proof bytes, after a complete deserialisation:
+    BITCOIN_ATTESTATION_PRESENT when an attestation node is a Bitcoin
+    block-header attestation; PENDING when the only attestations are
+    pending ones; INVALID otherwise, with the reason (bytes that are not
+    one whole proof, a proof of another digest when fp is given, no usable
+    attestation). Structural states only; see BITCOIN_ATTESTATION_PRESENT."""
+    try:
+        digest, attestations = proof_attestations(data)
+    except OtsError as exc:
+        return INVALID, str(exc).replace(" ", "_")
+    if fp is not None and digest != fp:
+        return INVALID, "digest"
+    kinds = {kind for kind, _ in attestations}
+    if "bitcoin" in kinds:
+        return BITCOIN_ATTESTATION_PRESENT, "bitcoin"
+    if "pending" in kinds:
+        return PENDING, "pending"
+    return INVALID, "no_usable_attestation"
+
+
+def bitcoin_attestation_present(data):
+    """True when the bytes are one whole proof with a Bitcoin block-header
+    attestation node. A structural fact about the file, not a verification
+    against Bitcoin."""
+    return inspect_proof(data)[0] == BITCOIN_ATTESTATION_PRESENT
 
 # An X-Digest: sha256 body is 64 hex chars plus whatever whitespace a shell
 # pipeline appends; anything bigger than this is not a digest.
@@ -397,16 +502,41 @@ def log_event(cfg, event, **kv):
 
 # durable writes
 def fsync_dir(path):
-    try:
-        fd = os.open(path, os.O_RDONLY)
-    except OSError:
-        return
+    """fsync a directory so a new entry or a rename is durable. Raises: a
+    directory that cannot be synced is a failure the caller must see (the
+    2026-09-15 review found a swallowed EIO reported as success)."""
+    fd = os.open(path, os.O_RDONLY)
     try:
         os.fsync(fd)
-    except OSError:
-        pass
     finally:
         os.close(fd)
+
+
+def write_all(fd, data):
+    """Every byte, or an error: os.write may write less than it was given."""
+    view = memoryview(data)
+    while len(view):
+        n = os.write(fd, view)
+        if n <= 0:
+            raise OSError(5, "write made no progress")
+        view = view[n:]
+
+
+# One lock per fingerprint: intake holds it from the debt's creation through
+# its directory fsync; the buyer holds it over the marker, proof and debt
+# transition; the upgrader takes it, without waiting, before it drops a
+# marker whose proof is absent. Locks are never removed: one small object
+# per fingerprint this process has seen.
+_FP_LOCKS = {}
+_FP_LOCKS_GUARD = threading.Lock()
+
+
+def fp_lock(fp):
+    with _FP_LOCKS_GUARD:
+        lock = _FP_LOCKS.get(fp)
+        if lock is None:
+            lock = _FP_LOCKS[fp] = threading.Lock()
+        return lock
 
 
 def atomic_write(path, data):
@@ -520,10 +650,6 @@ def proof_digest(data):
     if data[head] != 0x01 or data[head + 1] != 0x08:
         return None
     return data[head + 2:head + 34].hex()
-
-
-def is_anchored(data):
-    return BITCOIN_ATTESTATION in data
 
 
 class StateChange:
@@ -747,21 +873,35 @@ def proof_path(cfg, fp):
 
 
 def write_debt(cfg, fp):
-    """Create the debt durably (file fsync + directory fsync). True if newly
-    created, False if the fingerprint was already owed. Must complete before
-    'received' goes out — the debt is the promise."""
-    try:
-        fd = os.open(debt_path(cfg, fp),
-                     os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    except FileExistsError:
-        return False
-    try:
-        os.write(fd, (fp + "\n").encode())
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    fsync_dir(cfg["debts_dir"])
-    return True
+    """Create the debt durably: the file's bytes fsynced, then its
+    directory. True if newly created, False if the fingerprint was already
+    owed. The fingerprint's lock is held from creation through the
+    directory fsync, so a duplicate request is answered only once the
+    original is durable or gone: filename existence alone is never an
+    acknowledgement. A debt that cannot be made durable (a write, file
+    fsync or directory fsync error) is removed and the error raised; the
+    door answers 500, no promise. Must complete before 'received' goes
+    out — the debt is the promise."""
+    path = debt_path(cfg, fp)
+    with fp_lock(fp):
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            return False
+        try:
+            try:
+                write_all(fd, (fp + "\n").encode())
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            fsync_dir(cfg["debts_dir"])
+        except OSError:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
+        return True
 
 
 def list_debts_oldest_first(cfg):
@@ -796,11 +936,60 @@ def pending_path(cfg, fp):
 
 
 def pending_mark(cfg, fp):
+    """Create the marker and fsync its directory. Raises OSError: a marker
+    that is not on disk means a proof nothing would ever upgrade, so the
+    caller must not store the proof (store_proof)."""
+    fd = os.open(pending_path(cfg, fp), os.O_WRONLY | os.O_CREAT, 0o600)
+    os.close(fd)
+    fsync_dir(cfg["pending_dir"])
+
+
+def store_proof(cfg, fp, data):
+    """The one transition from owed to proof-on-disk, under the
+    fingerprint's lock: the pending marker (fsynced with its directory),
+    then the proof (atomic, fsynced), then the debt cleared. A marker that
+    cannot be created is fatal to the completion: nothing is stored, the
+    debt stays, `cannot_mark_pending` is logged and the next pass asks
+    again. Returns True when the proof is on disk and the debt cleared."""
+    with fp_lock(fp):
+        try:
+            pending_mark(cfg, fp)
+        except OSError as exc:
+            log_event(cfg, "cannot_mark_pending", fp=fp, err=type(exc).__name__)
+            return False
+        atomic_write(proof_path(cfg, fp), data)
+        clear_debt(cfg, fp)
+    return True
+
+
+def proof_on_disk(cfg, fp):
+    """True when a whole proof of fp is stored (INVALID bytes do not count:
+    they are what the reconciliation sets aside)."""
     try:
-        fd = os.open(pending_path(cfg, fp), os.O_WRONLY | os.O_CREAT, 0o600)
-        os.close(fd)
+        with open(proof_path(cfg, fp), "rb") as f:
+            data = f.read()
     except OSError:
-        log_event(cfg, "cannot_mark_pending", fp=fp)
+        return False
+    return inspect_proof(data, fp)[0] != INVALID
+
+
+def _drop_stale_marker(cfg, fp):
+    """A marker whose proof is absent is dropped only when nothing can
+    still write that proof: no debt, no sidecar, and no buyer mid-way (the
+    fingerprint's lock is taken without waiting; held means in flight).
+    The 2026-09-15 review's race: the upgrader dropped the marker between
+    the buyer's marker and its proof write, stranding the proof forever."""
+    lock = fp_lock(fp)
+    if not lock.acquire(blocking=False):
+        return
+    try:
+        if os.path.exists(proof_path(cfg, fp)) or os.path.exists(debt_path(cfg, fp)) \
+                or os.path.exists(sidecar_path(cfg, fp)):
+            return
+        pending_clear(cfg, fp)
+        log_event(cfg, "stale_marker_dropped", fp=fp)
+    finally:
+        lock.release()
 
 
 def pending_clear(cfg, fp):
@@ -823,9 +1012,9 @@ PENDING_BUILT = ".built"
 
 def build_pending_index(cfg):
     """One scan of the proofs directory (a DATA_DIR from before the index):
-    every proof without a Bitcoin attestation gets a marker. Idempotent —
-    a crash mid-scan leaves the .built flag absent and the next pass scans
-    again. Returns (pending, scanned)."""
+    every pending proof gets a marker. Idempotent — a crash mid-scan leaves
+    the .built flag absent and the next pass scans again. Returns (pending,
+    scanned)."""
     pending = scanned = 0
     for fp in list_proofs(cfg):
         scanned += 1
@@ -834,14 +1023,79 @@ def build_pending_index(cfg):
                 data = f.read()
         except OSError:
             continue
-        if not is_anchored(data):
-            pending_mark(cfg, fp)
+        if inspect_proof(data, fp)[0] == PENDING:
+            try:
+                pending_mark(cfg, fp)
+            except OSError as exc:
+                log_event(cfg, "cannot_mark_pending", fp=fp, err=type(exc).__name__)
+                continue
             pending += 1
     fd = os.open(os.path.join(cfg["pending_dir"], PENDING_BUILT),
                  os.O_WRONLY | os.O_CREAT, 0o600)
     os.close(fd)
     fsync_dir(cfg["pending_dir"])
     return pending, scanned
+
+
+def reconcile_state(cfg):
+    """Every start, before any thread: the debts, the proofs and the
+    pending index are made to agree, so an installation stranded by the
+    marker race or by a header-only "proof" (both possible before
+    2026-09-15, .built or not) is repaired. Each proof is deserialised
+    whole: a PENDING proof without a marker gets one back
+    (`pending_marker_restored`); a proof with a Bitcoin attestation loses a
+    stale marker; INVALID bytes are set aside as <fp>.ots.invalid-<time>
+    and the debt re-created so the buyer fetches a proper proof
+    (`proof_invalid_requeued`). A marker with neither proof nor debt nor
+    sidecar is dropped. A data directory from before the index (.built
+    absent) gets its markers here, logged once as `pending_index_built`.
+    Returns the counts."""
+    counts = collections.Counter()
+    first_index = not os.path.exists(os.path.join(cfg["pending_dir"], PENDING_BUILT))
+    scanned = pending = 0
+    for fp in list_proofs(cfg):
+        scanned += 1
+        path = proof_path(cfg, fp)
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except OSError:
+            counts["unreadable"] += 1
+            continue
+        state, reason = inspect_proof(data, fp)
+        marked = os.path.exists(pending_path(cfg, fp))
+        if state == BITCOIN_ATTESTATION_PRESENT:
+            if marked:
+                pending_clear(cfg, fp)
+                counts["markers_cleared"] += 1
+        elif state == PENDING:
+            pending += 1
+            if not marked:
+                pending_mark(cfg, fp)
+                if not first_index:
+                    log_event(cfg, "pending_marker_restored", fp=fp)
+                    counts["markers_restored"] += 1
+        else:
+            aside = path + ".invalid-%d" % int(time.time())
+            os.replace(path, aside)
+            pending_clear(cfg, fp)
+            write_debt(cfg, fp)
+            log_event(cfg, "proof_invalid_requeued", fp=fp, reason=reason)
+            counts["invalid_requeued"] += 1
+    for fp in list_pending(cfg):
+        if not (os.path.exists(proof_path(cfg, fp)) or os.path.exists(debt_path(cfg, fp))
+                or os.path.exists(sidecar_path(cfg, fp))):
+            pending_clear(cfg, fp)
+            counts["stale_markers_dropped"] += 1
+    fsync_dir(cfg["pending_dir"])
+    fsync_dir(cfg["proofs_dir"])
+    fd = os.open(os.path.join(cfg["pending_dir"], PENDING_BUILT), os.O_WRONLY | os.O_CREAT, 0o600)
+    os.close(fd)
+    fsync_dir(cfg["pending_dir"])
+    if first_index:
+        # A data directory from before the index: this was its one scan.
+        log_event(cfg, "pending_index_built", pending=pending, scanned=scanned)
+    return dict(counts)
 
 
 def load_sidecar(path):
@@ -939,18 +1193,23 @@ def _redeem(cfg, fp, macaroon, preimage, amt, flags, sidecar=None):
     _mark_up(cfg, flags, "gateway")
     if status == 200:
         if looks_like_ots(body):
-            if proof_digest(body) != fp:
+            state, reason = inspect_proof(body, fp)
+            if state == INVALID and reason == "digest":
                 # A proof of somebody else's digest is not ours to store: the
                 # sidecar keeps the preimage and the next pass asks again.
                 log_event(cfg, "proof_wrong_digest", fp=fp, note="paid",
                           got=(proof_digest(body) or "none")[:12])
                 return True
-            pending_mark(cfg, fp)
-            atomic_write(proof_path(cfg, fp), body)
-            clear_debt(cfg, fp)
+            if state == INVALID:
+                # Bytes that are not one whole proof: never stored, the
+                # sidecar keeps the preimage and the next pass asks again.
+                log_event(cfg, "proof_invalid", fp=fp, note="paid", reason=reason)
+                return True
+            if not store_proof(cfg, fp, body):
+                return True
             flags["attention"].discard(fp)
             log_event(cfg, "bought", fp=fp,
-                      sats=amt if amt is not None else "unknown")
+                      sats=amt if amt is not None else "unknown", state=state)
             return True
         log_event(cfg, "redeem_failed", fp=fp, status=status,
                   note="body_not_ots_paid_but_unredeemed")
@@ -1100,9 +1359,10 @@ def buy_one(cfg, password, fp, flags):
     pass; False = stop the pass (gateway or payer down, rate-limited, the
     ledger unreadable, or the breaker tripped). Every skip leaves the debt
     in place — never dropped."""
-    if os.path.exists(proof_path(cfg, fp)):
+    if proof_on_disk(cfg, fp):
         # One record, one payment, one proof: a re-POSTed or already-bought
-        # fingerprint costs nothing.
+        # fingerprint costs nothing. Only a whole proof of this fingerprint
+        # counts; INVALID bytes are the reconciliation's to set aside.
         clear_debt(cfg, fp)
         log_event(cfg, "already_bought", fp=fp)
         return True
@@ -1142,15 +1402,20 @@ def _buy_challenged(cfg, password, fp, status, headers, body, day, spent, flags)
     have reserved against the ledger in between."""
     if status == 200 and looks_like_ots(body):
         # The gateway handed the proof over without charging: its free door
-        # (L402_ENABLED=false).
-        if proof_digest(body) != fp:
+        # (L402_ENABLED=false), or the calendar's answer. The bytes are
+        # deserialised whole and their attestation nodes inspected before
+        # anything is stored or the debt touched.
+        state, reason = inspect_proof(body, fp)
+        if state == INVALID and reason == "digest":
             log_event(cfg, "proof_wrong_digest", fp=fp, note="free",
                       got=(proof_digest(body) or "none")[:12])
             return True  # the debt stays; the next pass asks again
-        pending_mark(cfg, fp)
-        atomic_write(proof_path(cfg, fp), body)
-        clear_debt(cfg, fp)
-        log_event(cfg, "proof_free", fp=fp)
+        if state == INVALID:
+            log_event(cfg, "proof_invalid", fp=fp, note="free", reason=reason)
+            return True  # the debt stays; the next pass asks again
+        if not store_proof(cfg, fp, body):
+            return True
+        log_event(cfg, "proof_free", fp=fp, state=state)
         return True
     if status == 429:
         wait = _retry_after_secs(headers)
@@ -1266,7 +1531,7 @@ def _buyer_pass_inflight(cfg, password, flags):
                     break
                 fp = queue[idx]
                 idx += 1
-                if os.path.exists(proof_path(cfg, fp)):
+                if proof_on_disk(cfg, fp):
                     buy_one(cfg, password, fp, flags)  # already_bought: no contact
                     continue
                 if load_sidecar(sidecar_path(cfg, fp))[0] is not None:
@@ -1352,8 +1617,10 @@ def buyer_loop(cfg, password, hb):
 # the upgrader
 def _apply_upgrade(cfg, fp, path, body):
     """One /upgrade answer for fp. The file is replaced only when the
-    response says bitcoin_anchored and the returned bytes agree; the marker
-    is cleared after the anchored bytes are on disk. True when anchored."""
+    response says bitcoin_anchored and the returned bytes, deserialised
+    whole, carry a Bitcoin attestation node and are a proof of this
+    fingerprint; the marker is cleared after those bytes are on disk and
+    `bitcoin_attestation_present` is logged. True when that happened."""
     try:
         resp = json.loads(body)
     except ValueError:
@@ -1367,21 +1634,23 @@ def _apply_upgrade(cfg, fp, path, body):
         except ValueError:
             log_event(cfg, "upgrade_failed", fp=fp, status="bad_base64")
             return False
-        if looks_like_ots(new_bytes) and is_anchored(new_bytes):
-            if proof_digest(new_bytes) != fp:
-                log_event(cfg, "proof_wrong_digest", fp=fp, note="upgrade",
-                          got=(proof_digest(new_bytes) or "none")[:12])
-                return False  # the pending proof and its marker stay
-            try:
-                atomic_write(path, new_bytes)
-            except OSError:
-                log_event(cfg, "upgrade_failed", fp=fp, status="write_failed")
-                return False
-            pending_clear(cfg, fp)
-            log_event(cfg, "anchored", fp=fp)
+        state, reason = inspect_proof(new_bytes, fp)
+        if state == INVALID and reason == "digest":
+            log_event(cfg, "proof_wrong_digest", fp=fp, note="upgrade",
+                      got=(proof_digest(new_bytes) or "none")[:12])
+            return False  # the pending proof and its marker stay
+        if state == BITCOIN_ATTESTATION_PRESENT:
+            with fp_lock(fp):
+                try:
+                    atomic_write(path, new_bytes)
+                except OSError:
+                    log_event(cfg, "upgrade_failed", fp=fp, status="write_failed")
+                    return False
+                pending_clear(cfg, fp)
+            log_event(cfg, BITCOIN_ATTESTATION_PRESENT, fp=fp)
             return True
         log_event(cfg, "upgrade_failed", fp=fp,
-                  status="anchored_reply_without_anchored_bytes")
+                  status="anchored_reply_without_attestation", reason=reason)
         return False
     # invalid / mismatch / no_attestations: our artifact is wrong — loud.
     log_event(cfg, "upgrade_needs_attention", fp=fp, status=resp.get("status"))
@@ -1416,11 +1685,11 @@ def upgrade_pass(cfg, flags):
                     with open(path, "rb") as f:
                         data = f.read()
                 except FileNotFoundError:
-                    pending_clear(cfg, fp)  # a marker without its proof
+                    _drop_stale_marker(cfg, fp)  # never while a debt exists or a buyer is mid-way
                     continue
                 except OSError:
                     continue
-                if is_anchored(data):
+                if bitcoin_attestation_present(data):
                     pending_clear(cfg, fp)  # finished by an earlier pass
                     continue
                 checked += 1
@@ -1501,16 +1770,18 @@ def make_handler(cfg):
 
         def _reply(self, code, text, extra=None):
             payload = (text + "\n").encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "text/plain; charset=utf-8")
-            self.send_header("Content-Length", str(len(payload)))
-            for k, v in (extra or {}).items():
-                self.send_header(k, v)
-            self.end_headers()
             try:
+                self.send_response(code)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Content-Length", str(len(payload)))
+                for k, v in (extra or {}).items():
+                    self.send_header(k, v)
+                self.end_headers()
                 self.wfile.write(payload)
-            except OSError:
-                pass
+            except OSError as exc:
+                # The client went away mid-reply. Logged as a fixed event,
+                # never through the server's error path (which names the peer).
+                log_event(cfg, "reply_failed", err=type(exc).__name__)
 
         def _method_not_allowed(self):
             self._reply(405, "method not allowed; the only route is POST /record",
@@ -1586,7 +1857,7 @@ def make_handler(cfg):
                     self._reply(code, msg)
                 return
             new_debt = False
-            if not os.path.exists(proof_path(cfg, fp)):
+            if not proof_on_disk(cfg, fp):
                 try:
                     new_debt = write_debt(cfg, fp)
                 except OSError:
@@ -1599,6 +1870,21 @@ def make_handler(cfg):
             self._reply(200, "received " + fp)
 
     return Handler
+
+
+class DoorServer(ThreadingHTTPServer):
+    """The base class's handle_error prints 'Exception occurred during
+    processing of request from (IP, port)' and a traceback to stderr, which
+    the unit keeps: a client identity on disk (2026-09-15 review, A11).
+    Here the exception class alone is logged, as a fixed event."""
+
+    def __init__(self, address, handler, cfg):
+        self.cfg = cfg
+        super().__init__(address, handler)
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        log_event(self.cfg, "request_error", err=type(exc).__name__)
 
 
 # main
@@ -1620,8 +1906,16 @@ def main():
         return 2
 
     try:
-        server = ThreadingHTTPServer((cfg["listen_host"], cfg["listen_port"]),
-                                     make_handler(cfg))
+        reconciled = reconcile_state(cfg)
+    except OSError as e:
+        print(f"api-endpoint: cannot reconcile DATA_DIR: {e}", file=sys.stderr)
+        return 2
+    if reconciled:
+        log_event(cfg, "reconciled", **reconciled)
+
+    try:
+        server = DoorServer((cfg["listen_host"], cfg["listen_port"]),
+                            make_handler(cfg), cfg)
     except OSError as e:
         print(f"api-endpoint: cannot bind LISTEN_ADDR "
               f"{cfg['listen_host']}:{cfg['listen_port']}: {e}", file=sys.stderr)

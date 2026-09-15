@@ -56,15 +56,25 @@ OTHER_DIGEST = hashlib.sha256(b"someone else's record").hexdigest()
 OTS_HEAD = api_endpoint.OTS_MAGIC + b"\x01\x08"
 
 
+def _varbytes(b):
+    return api_endpoint.varuint(len(b)) + b
+
+
 def pending_ots(fp):
-    b = OTS_HEAD + bytes.fromhex(fp) + CAL_TAG + b"fake-calendar"
+    """A complete pending proof: the digest attested by a calendar URI.
+    (Before 2026-09-15 this was a bare tag followed by text, which the
+    header check accepted; the adapter now deserialises the whole proof.)"""
+    b = OTS_HEAD + bytes.fromhex(fp) + CAL_TAG + _varbytes(_varbytes(b"http://fake-calendar/"))
     assert api_endpoint.BITCOIN_ATTESTATION not in b
+    assert api_endpoint.inspect_proof(b, fp) == (api_endpoint.PENDING, "pending")
     return b
 
 
 def anchored_ots(fp):
-    return (OTS_HEAD + bytes.fromhex(fp)
-            + api_endpoint.BITCOIN_ATTESTATION + b"\x01\x02")
+    """A complete proof with a Bitcoin block-header attestation (height 2)."""
+    b = OTS_HEAD + bytes.fromhex(fp) + api_endpoint.BITCOIN_ATTESTATION + b"\x01\x02"
+    assert api_endpoint.inspect_proof(b, fp) == (api_endpoint.BITCOIN_ATTESTATION_PRESENT, "bitcoin")
+    return b
 
 
 def free_port():
@@ -705,10 +715,10 @@ class TestAnchoredDetector(unittest.TestCase):
         with open(PENDING_REAL, "rb") as f:
             pending = f.read()
         self.assertTrue(api_endpoint.looks_like_ots(anchored))
-        self.assertTrue(api_endpoint.is_anchored(anchored),
+        self.assertTrue(api_endpoint.bitcoin_attestation_present(anchored),
                         "real anchored proof not detected as anchored")
         self.assertTrue(api_endpoint.looks_like_ots(pending))
-        self.assertFalse(api_endpoint.is_anchored(pending),
+        self.assertFalse(api_endpoint.bitcoin_attestation_present(pending),
                          "real pending proof wrongly detected as anchored")
 
 
@@ -1190,7 +1200,7 @@ class TestWrongDigestRefused(IntegrationBase):
             self.assertEqual(f.read(), pending_ots(fp))   # untouched
         self.assertIn(fp, os.listdir(self.data("pending")))
         self.gw.wrong_digest = False
-        self.wait_until(lambda: api_endpoint.is_anchored(open(self.proof_file(fp), "rb").read()),
+        self.wait_until(lambda: api_endpoint.bitcoin_attestation_present(open(self.proof_file(fp), "rb").read()),
                         what="anchored after recovery")
         with open(self.proof_file(fp), "rb") as f:
             self.assertEqual(api_endpoint.proof_digest(f.read()), fp)
@@ -1214,12 +1224,12 @@ class TestUpgrader(IntegrationBase):
 
         def proof_is_anchored():
             with open(self.proof_file(fp), "rb") as f:
-                return api_endpoint.is_anchored(f.read())
+                return api_endpoint.bitcoin_attestation_present(f.read())
 
         self.wait_until(proof_is_anchored, what="proof anchored on disk")
         with open(self.proof_file(fp), "rb") as f:
             self.assertEqual(f.read(), anchored_ots(fp))
-        self.assertIn("anchored fp=" + fp, self.read_service_log())
+        self.assertIn("bitcoin_attestation_present fp=" + fp, self.read_service_log())
         # Anchored proofs are never polled again.
         n = self.gw.upgrades_for(fp)
         time.sleep(0.6)
@@ -1422,12 +1432,12 @@ class TestUpgradeBacklog(IntegrationBase):
         self.gw.anchor_now.update(fps)
         self.start_service(UPGRADE_SECS="0.2", GATEWAY_UPGRADE_TOKEN="upgrade-tok",
                            UPGRADE_INFLIGHT="8")
-        self.wait_until(lambda: all(api_endpoint.is_anchored(open(self.proof_file(fp), "rb").read())
+        self.wait_until(lambda: all(api_endpoint.bitcoin_attestation_present(open(self.proof_file(fp), "rb").read())
                                     for fp in fps), timeout=30, what="every pending proof anchored")
         self.assertEqual(self.pending_index(), [])
         log = self.read_service_log()
         self.assertNotIn("upgrade_rate_limited", log)
-        self.assertEqual(log.count(" anchored fp="), 40)
+        self.assertEqual(log.count(" bitcoin_attestation_present fp="), 40)
         self.assertTrue(all(a == "Bearer upgrade-tok" for a in self.gw.upgrade_auth_seen))
         # Anchored proofs are never polled again: one call per fingerprint.
         time.sleep(0.6)
@@ -1444,7 +1454,7 @@ class TestUpgradeBacklog(IntegrationBase):
         self.wait_until(lambda: "upgrade_rate_limited" in self.read_service_log(),
                         what="rate_limited logged")
         time.sleep(0.5)
-        anchored = sum(api_endpoint.is_anchored(open(self.proof_file(fp), "rb").read()) for fp in fps)
+        anchored = sum(api_endpoint.bitcoin_attestation_present(open(self.proof_file(fp), "rb").read()) for fp in fps)
         self.assertLessEqual(anchored, 5)
         self.assertGreaterEqual(len(self.pending_index()), 35)
 
@@ -1456,7 +1466,7 @@ class TestUpgradeBacklog(IntegrationBase):
         self.wait_until(lambda: os.path.exists(self.proof_file(fp)), what="proof")
         self.assertIn(fp, self.pending_index())
         self.gw.anchor_now.add(fp)
-        self.wait_until(lambda: api_endpoint.is_anchored(open(self.proof_file(fp), "rb").read()),
+        self.wait_until(lambda: api_endpoint.bitcoin_attestation_present(open(self.proof_file(fp), "rb").read()),
                         what="anchored on disk")
         self.wait_until(lambda: fp not in self.pending_index(), what="marker cleared")
         n = self.gw.upgrades_for(fp)
@@ -1871,13 +1881,13 @@ class TestOtsParser(unittest.TestCase):
         self.assertEqual(proof.commitment, commitment)
         self.assertEqual(proof.attestation, ("pending", CAL_URI))
         self.assertEqual(api_endpoint.proof_digest(ots), digest.hex())
-        self.assertFalse(api_endpoint.is_anchored(ots))
+        self.assertFalse(api_endpoint.bitcoin_attestation_present(ots))
 
         upgraded = api_endpoint.splice_upgrade(ots, cal_bitcoin_response(965446))
         up = api_endpoint.parse_ots(upgraded)
         self.assertEqual(up.digest, digest)
         self.assertEqual(up.attestation, ("bitcoin", 965446))
-        self.assertTrue(api_endpoint.is_anchored(upgraded))
+        self.assertTrue(api_endpoint.bitcoin_attestation_present(upgraded))
         self.assertEqual(upgraded[:proof.ops_end], ots[:proof.ops_end])
 
         with self.assertRaises(api_endpoint.OtsError):
@@ -1952,7 +1962,7 @@ class TestCalendarMode(CalendarBase):
             data = f.read()
         self.assertEqual(data, OTS_HEAD + digest + cal_pending_response(digest)[0])
         self.assertEqual(api_endpoint.proof_digest(data), fp)
-        self.assertFalse(api_endpoint.is_anchored(data))
+        self.assertFalse(api_endpoint.bitcoin_attestation_present(data))
         self.assertTrue(os.path.exists(self.pending_file(fp)))
         self.assertIn(f" proof_free fp={fp}", self.read_service_log())
 
@@ -2030,7 +2040,7 @@ class TestCalendarMode(CalendarBase):
                         what="an upgrade GET for the commitment")
         time.sleep(0.5)
         self.assertTrue(os.path.exists(self.pending_file(fp)))
-        self.assertNotIn(f" anchored fp={fp}", self.read_service_log())
+        self.assertNotIn(f" bitcoin_attestation_present fp={fp}", self.read_service_log())
         with open(self.proof_file(fp), "rb") as f:
             self.assertEqual(f.read(), original)
 
@@ -2042,8 +2052,8 @@ class TestCalendarMode(CalendarBase):
         ops_end = api_endpoint.parse_ots(original).ops_end
         self.assertEqual(data, original[:ops_end] + cal_bitcoin_response(965446))
         self.assertEqual(api_endpoint.proof_digest(data), fp)
-        self.assertTrue(api_endpoint.is_anchored(data))
-        self.assertIn(f" anchored fp={fp}", self.read_service_log())
+        self.assertTrue(api_endpoint.bitcoin_attestation_present(data))
+        self.assertIn(f" bitcoin_attestation_present fp={fp}", self.read_service_log())
         gets = self.cal.gets
         time.sleep(0.8)
         self.assertEqual(self.cal.gets, gets)  # a complete proof is never asked about again

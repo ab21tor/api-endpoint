@@ -32,8 +32,11 @@ wrong-digest refusal.
 Each rule is made by the code and pinned by the tests "Tests" names.
 
 - "received" is sent only after the debt is durable: the debt file is
-  written and fsynced, and its directory fsynced, before the reply; a
-  debt that cannot be written is a 500 and no promise ("The door").
+  written and fsynced, and its directory fsynced, before the reply, under
+  the fingerprint's lock, so a duplicate request is answered only once
+  the original is durable or gone; a debt that cannot be written or
+  synced (its directory included) is removed, and the reply is a 500 and
+  no promise ("The door").
 - A fingerprint is in flight at most once, and payments are never
   concurrent ("Concurrency").
 - The budget counts attempts, not successes: spend is recorded before
@@ -48,11 +51,28 @@ Each rule is made by the code and pinned by the tests "Tests" names.
   paused, and the backlog drains oldest-first when it resumes.
 - A paid preimage is never dropped and never re-paid: settlement outranks
   expiry ("The debt lifecycle").
-- A proof is stored only if it is a proof of the fingerprint this
-  adapter asked for, on the free door, on a paid redeem and on an upgrade
-  alike; anything else is refused and logged `proof_wrong_digest`.
+- A proof is stored only if it deserialises whole, its attestation nodes
+  inspected, and is a proof of the fingerprint this adapter asked for, on
+  the free door, on a paid redeem and on an upgrade alike; anything else
+  is refused and logged `proof_wrong_digest` or `proof_invalid`, and the
+  debt stays. Its pending marker is on disk (directory fsynced) before
+  the proof, and if the marker cannot be made nothing is stored.
+- The words: a proof is `pending` while its only attestations name a
+  calendar, and `bitcoin_attestation_present` once an attestation node
+  names a Bitcoin block. Both are structural states of the bytes.
+  "Verified" is reserved for replaying the proof against the Bitcoin
+  block header, which this adapter never does ("Verify").
+- Every start reconciles the debts, the proofs and the pending index, so
+  a proof stranded without its marker, or bytes stored as a proof that
+  are not one, are repaired before the door opens ("Recover").
 - The phoenixd password lives only in memory and an Authorization
   header: no subprocesses, so never in argv; never logged.
+- No client address reaches the log or stderr: per-request logging is
+  off, a reply that fails mid-write is logged as `reply_failed` with the
+  exception class alone, and the server's error path (which the standard
+  library would use to print the peer and a traceback) is replaced by a
+  `request_error` line naming the exception class alone ("Tests",
+  `test_review_fixes.py`).
 
 ## Requirements
 
@@ -108,8 +128,8 @@ Whatever can reach `LISTEN_ADDR` can submit records and, with
 |---|---|
 | `debts/<fp>` | owed fingerprint; written and fsynced before "received" goes out |
 | `debts/<fp>.l402` | in-flight purchase: the L402 challenge, plus the preimage once paid; `attempts` / `attention` once the gateway keeps refusing that preimage |
-| `proofs/<fp>.ots` | the proof; anchored once its bytes carry a Bitcoin block-header attestation |
-| `pending/<fp>` | empty marker for a proof still waiting for its Bitcoin attestation, written before the proof and removed once the anchored bytes are on disk; the upgrader works from this index and never re-reads the proofs directory (a data directory from before the index is scanned once at the first upgrade pass, `pending_index_built` in the log) |
+| `proofs/<fp>.ots` | the proof: `pending` while its attestations name a calendar, `bitcoin_attestation_present` once an attestation node names a Bitcoin block (decided by deserialising the whole file, never by scanning its bytes) |
+| `pending/<fp>` | empty marker for a proof still waiting for its Bitcoin attestation, written and fsynced before the proof and removed once bytes with the attestation are on disk; the upgrader works from this index and never re-reads the proofs directory, and drops a marker whose proof is absent only when no debt, no sidecar and no buyer mid-way can still write it; every start reconciles the index against the proofs ("Recover") |
 | `ledger` | one line `YYYY-MM-DD SPENT_SATS` per UTC day: attempts, not successes |
 | `heartbeat` | one line: time, pid, buyer and upgrader last-pass times, breaker state, `attention=N` paid-but-refused sidecars at the retry ceiling |
 | `log` | append-only fixed-format events |
@@ -166,7 +186,7 @@ calendar's counted `POST /digest`, never the operator lane
 calendar's receipts. The calendar answers the serialized pending timestamp;
 the adapter prefixes the detached-file header (magic, version, the sha256
 op, the digest) and stores the result exactly as a free-door answer, with
-the same `proof_digest` check, pending marker, atomic write and
+the same whole-proof check, pending marker, atomic write and
 `clear_debt`. The bytes are what the `ots` client writes for a single
 calendar; the parser that builds and later upgrades them is a copy of the
 one in the fork's `ops/selfstamp.py`, cross-checked against the
@@ -204,11 +224,14 @@ place; there is no separate retry logic.
 ### The debt lifecycle
 
 owed (`debts/<fp>`) → in flight (`debts/<fp>.l402`: challenged, then paid)
-→ proof (`proofs/<fp>.ots`, pending, with a `pending/<fp>` marker) →
-anchored: the upgrader polls for every marker, `UPGRADE_INFLIGHT` at a
-time, until the proof's bytes carry a Bitcoin block-header attestation,
-and the marker goes once they do. Debts and sidecars carry everything
-across a death; there is no shutdown sequence.
+→ proof (`proofs/<fp>.ots`, `pending`, with a `pending/<fp>` marker) →
+`bitcoin_attestation_present`: the upgrader polls for every marker,
+`UPGRADE_INFLIGHT` at a time, until the proof, deserialised whole, has an
+attestation node that names a Bitcoin block, and the marker goes once
+those bytes are on disk. The marker, the proof and the debt change hands
+under the fingerprint's lock, and a marker whose proof is absent is never
+dropped while a debt exists. Debts and sidecars carry everything across a
+death; there is no shutdown sequence.
 
 A stale unpaid challenge past `L402_EXPIRY_SECS` is abandoned and
 re-challenged, logged `rechallenge_after_unknown_payment …
@@ -237,11 +260,12 @@ set). With `CALENDAR_URL` it walks the pending proof to its commitment and
 asks `GET /timestamp/<commitment>`: 404 while the anchor is not yet deep,
 the path to the Bitcoin attestation once it is, spliced in at the
 attestation marker. In both, the file is replaced only when the answer is
-anchored, its bytes carry the attestation and are a proof of the same
-digest (`proof_wrong_digest` otherwise, the pending proof and its marker
-kept); the marker is cleared after the anchored bytes are on disk and
-`anchored` is logged. A proof the adapter cannot walk (a fork marker,
-which a proof from one calendar never has) is logged
+anchored, its bytes deserialise whole with an attestation node that names
+a Bitcoin block, and they are a proof of the same digest
+(`proof_wrong_digest` otherwise, the pending proof and its marker kept);
+the marker is cleared after those bytes are on disk and
+`bitcoin_attestation_present` is logged. A proof the adapter cannot walk
+(a fork marker, which a proof from one calendar never has) is logged
 `upgrade_needs_attention status=nonlinear` with its marker kept.
 
 ### Switching configurations
@@ -264,21 +288,36 @@ entirely.
 
 ## Verify
 
-A proof is anchored when its bytes carry a Bitcoin block-header
-attestation; until then it is a pending receipt, and `pending/<fp>`
-exists. The `heartbeat` line carries the buyer's and upgrader's last
-passes, the breaker state and the count of sidecars at the retry ceiling;
-the `log` carries each event. Verifying an anchored proof against Bitcoin
-is the calendar's and gateway's documentation (fork README, "Verify").
+A proof is `bitcoin_attestation_present` when, deserialised whole, one of
+its attestation nodes names a Bitcoin block; until then it is `pending`,
+a receipt naming a calendar, and `pending/<fp>` exists. Both are
+structural states of the file: neither replays the proof against the
+Bitcoin block header, so neither is "verified", and the adapter never
+uses that word. The `heartbeat` line carries the buyer's and upgrader's
+last passes, the breaker state and the count of sidecars at the retry
+ceiling; the `log` carries each event. Verifying a proof against Bitcoin
+is the calendar's and gateway's documentation (fork README, "Verify": the
+claim kit, or `ots verify`).
 
 ## Recover
 
 Debts and sidecars carry everything across a death; there is no shutdown
-sequence. At a restart the buyer starts with the breaker closed and the
-debts oldest first, resuming in-flight sidecars as above; the upgrader
-rebuilds the pending index once if its `.built` flag is absent. What to
-keep is `DATA_DIR`: the proofs, the debts and sidecars, the pending
-markers, the ledger, and the log.
+sequence. Every start, before the door opens, reconciles `DATA_DIR`
+(`reconciled …` in the log, with counts): each proof is deserialised
+whole; a `pending` proof without its marker gets it back
+(`pending_marker_restored`); a proof with a Bitcoin attestation loses a
+stale marker; bytes that are not one whole proof of their fingerprint are
+set aside as `<fp>.ots.invalid-<time>` and the debt re-created so the
+buyer fetches a proper proof (`proof_invalid_requeued`); a marker with
+neither proof nor debt is dropped. This repairs an installation stranded
+by the marker race or by a header-only "proof" that earlier releases
+accepted, whether or not `.built` exists. Then the buyer starts with the
+breaker closed and the debts oldest first, resuming in-flight sidecars as
+above. What to keep is `DATA_DIR`: the proofs, the debts and sidecars,
+the pending markers, the ledger, and the log. The durability tests inject
+errors and interrupted writes at the write boundaries and kill the
+process; a power cut is not simulated, and the fsyncs are what a power
+cut relies on.
 
 ## What it does not do
 
@@ -311,8 +350,8 @@ python3 -m unittest test_api_endpoint -v
 
 What it pins, by test name. The door contract, including the 411, 400 and
 405 refusals and the durable-debt-before-received ordering; the budget,
-breaker and ledger rules; anchored-versus-pending detection against real
-proofs (`test_anchored_detector_against_real_proofs`, on the two proofs in
+breaker and ledger rules; attestation-present-versus-pending detection
+against real proofs (`test_anchored_detector_against_real_proofs`, on the two proofs in
 `fixtures/`). The crash and money invariants:
 `test_sigkill_mid_burst_every_acked_record_bought`,
 `test_kill_inside_pay_to_redeem_window_exactly_one_payment`,
@@ -353,6 +392,15 @@ third refused payment and freezes submissions
 (`test_inflight_breaker_trips_and_stops_submissions`); the setting is a
 strict positive integer defaulting to 1
 (`test_inflight_knob_strict_positive_int_default_one`).
+
+`test_review_fixes.py` holds the 2026-09-15 review's findings as
+regressions, each failing on the code before the fix: the structural
+states decided by attestation nodes and never by a byte scan; intake's
+per-fingerprint lock, directory-fsync errors propagated, short writes
+completed; the marker kept while a debt exists, fatal when it cannot be
+made, fsynced before the debt is cleared; header-only and trailing-byte
+answers refused; the startup reconciliation, on the objects and with the
+real service; and the quiet server on a client disconnect.
 
 `CALENDAR_URL`, against a fake calendar speaking the fork's protocol:
 exactly one of the two URLs, and the calendar-mode defaults
