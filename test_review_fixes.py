@@ -421,3 +421,100 @@ class TestQuietServer(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestOldSidecarReservation(UnitBase):
+    """A7 (carried, fixed 2026-09-15): an unpaid sidecar from an earlier day
+    was re-paid against its old reservation, so today's whole budget stayed
+    open beside it, and the retry never asked the wallet whether the earlier
+    call had in fact settled. Now the wallet is asked first, and a
+    definitely unpaid invoice reserves today's budget before payinvoice."""
+
+    def old_sidecar(self, with_hash=True):
+        self.cfg.update(mode="gateway", daily_budget_sats=10)
+        a.write_debt(self.cfg, self.fp)
+        h = "ee" * 32
+        if with_hash:
+            a.write_sidecar(a.sidecar_path(self.cfg, self.fp), "mac", "invoice", payment_hash=h, amount_sats=10)
+        else:
+            a.write_sidecar(a.sidecar_path(self.cfg, self.fp), "mac", "invoice")
+        a.write_ledger(self.cfg["ledger_path"], "2000-01-01", 10)   # yesterday's reservation
+        return h
+
+    def test_a_definitely_unpaid_old_sidecar_reserves_todays_budget_before_retry(self):
+        h = self.old_sidecar()
+        order = []
+        with patch.object(a, "wallet_payment_outcome", return_value=("failed", None)) as wallet, \
+             patch.object(a, "pay_invoice", side_effect=lambda *args: (order.append(("pay", a.read_ledger(self.cfg["ledger_path"]))), "cd" * 32)[1]) as pay, \
+             patch.object(a, "gateway_redeem", return_value=(200, {}, pending(self.fp))):
+            a.buy_one(self.cfg, None, self.fp, flags())
+        wallet.assert_called_once_with(self.cfg, None, h)
+        pay.assert_called_once()
+        # Today's reservation was on disk BEFORE the payinvoice call ...
+        self.assertEqual(order, [("pay", (a.utc_today(), 10))])
+        self.assertEqual(a.read_ledger(self.cfg["ledger_path"]), (a.utc_today(), 10))
+        # ... and today's budget is spent by it: no further purchase today.
+        self.assertEqual(a._budget_preflight(self.cfg, flags())[0], "skip")
+        self.assertTrue(os.path.exists(a.proof_path(self.cfg, self.fp)))
+
+    def test_a_settled_old_sidecar_is_redeemed_with_the_wallets_preimage_and_never_repaid(self):
+        h = self.old_sidecar()
+        preimage = "ab" * 32
+        with patch.object(a, "wallet_payment_outcome", return_value=("paid", preimage)), \
+             patch.object(a, "pay_invoice") as pay, \
+             patch.object(a, "gateway_redeem", return_value=(200, {}, pending(self.fp))) as redeem:
+            a.buy_one(self.cfg, None, self.fp, flags())
+        pay.assert_not_called()
+        redeem.assert_called_once_with(self.cfg, self.fp, "mac", preimage)
+        self.assertEqual(a.read_ledger(self.cfg["ledger_path"]), ("2000-01-01", 10))   # nothing reserved
+        self.assertTrue(os.path.exists(a.proof_path(self.cfg, self.fp)))
+
+    def test_an_unknown_outcome_waits_without_paying_or_reserving(self):
+        h = self.old_sidecar()
+        with patch.object(a, "wallet_payment_outcome", return_value=("unknown", None)), \
+             patch.object(a, "pay_invoice") as pay, \
+             patch.object(a, "gateway_redeem") as redeem:
+            self.assertTrue(a.buy_one(self.cfg, None, self.fp, flags()))
+        pay.assert_not_called()
+        redeem.assert_not_called()
+        self.assertEqual(a.read_ledger(self.cfg["ledger_path"]), ("2000-01-01", 10))
+        self.assertTrue(os.path.exists(a.sidecar_path(self.cfg, self.fp)))
+        self.assertTrue(os.path.exists(a.debt_path(self.cfg, self.fp)))
+        self.assertIn("payment_outcome_unknown", open(os.path.join(self.cfg["data_dir"], "log")).read())
+
+    def test_todays_budget_gates_the_retry(self):
+        self.old_sidecar()
+        a.write_ledger(self.cfg["ledger_path"], a.utc_today(), 5)   # 5 left of 10, the retry needs 10
+        with patch.object(a, "wallet_payment_outcome", return_value=("failed", None)), \
+             patch.object(a, "pay_invoice") as pay:
+            self.assertTrue(a.buy_one(self.cfg, None, self.fp, flags()))
+        pay.assert_not_called()
+        self.assertEqual(a.read_ledger(self.cfg["ledger_path"]), (a.utc_today(), 5))
+        self.assertIn("retry_of_stored_invoice", open(os.path.join(self.cfg["data_dir"], "log")).read())
+
+    def test_a_sidecar_from_before_the_hash_was_stored_is_decoded_first(self):
+        self.old_sidecar(with_hash=False)
+        with patch.object(a, "decode_invoice", return_value=(10, "ff" * 32)) as decode, \
+             patch.object(a, "wallet_payment_outcome", return_value=("failed", None)) as wallet, \
+             patch.object(a, "pay_invoice", return_value="cd" * 32), \
+             patch.object(a, "gateway_redeem", return_value=(200, {}, pending(self.fp))):
+            a.buy_one(self.cfg, None, self.fp, flags())
+        decode.assert_called_once_with(self.cfg, None, "invoice")
+        wallet.assert_called_once_with(self.cfg, None, "ff" * 32)
+        self.assertEqual(a.read_ledger(self.cfg["ledger_path"]), (a.utc_today(), 10))
+
+    def test_wallet_outcome_rules(self):
+        with patch.object(a, "http_get", return_value=(204, {}, b"")):
+            self.assertEqual(a.wallet_payment_outcome(self.cfg, "pw", "aa" * 32), ("failed", None))
+        preimage = "12" * 32
+        h = a.sha256(bytes.fromhex(preimage)).hexdigest()
+        with patch.object(a, "http_get", return_value=(200, {}, json.dumps({"isPaid": True, "preimage": preimage}).encode())):
+            self.assertEqual(a.wallet_payment_outcome(self.cfg, "pw", h), ("paid", preimage))
+            # A preimage that is not this hash's is not a settlement of it.
+            self.assertEqual(a.wallet_payment_outcome(self.cfg, "pw", "bb" * 32), ("unknown", None))
+        with patch.object(a, "http_get", return_value=(200, {}, json.dumps({"isPaid": False, "completedAt": 5}).encode())):
+            self.assertEqual(a.wallet_payment_outcome(self.cfg, "pw", h), ("failed", None))
+        with patch.object(a, "http_get", return_value=(200, {}, json.dumps({"isPaid": False, "completedAt": None}).encode())):
+            self.assertEqual(a.wallet_payment_outcome(self.cfg, "pw", h), ("unknown", None))
+        with patch.object(a, "http_get", return_value=(500, {}, b"boom")):
+            self.assertEqual(a.wallet_payment_outcome(self.cfg, "pw", h), ("unknown", None))

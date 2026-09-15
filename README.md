@@ -39,8 +39,14 @@ Each rule is made by the code and pinned by the tests "Tests" names.
   no promise ("The door").
 - A fingerprint is in flight at most once, and payments are never
   concurrent ("Concurrency").
-- The budget counts attempts, not successes: spend is recorded before
-  each `payinvoice` call and never refunded within the day.
+- The budget counts attempts, not successes: spend is recorded, against
+  the current UTC day, before each `payinvoice` call — a fresh challenge
+  and the retry of a stored invoice alike — and never refunded within
+  the day. A retry first asks the wallet what became of the earlier call
+  (`GET /payments/outgoingbyhash`): a settled one is redeemed with the
+  wallet's preimage and pays nothing; an unknown one waits; only a
+  definitely unpaid one is paid again, after today's reservation
+  ("The debt lifecycle").
 - A run of consecutive payment failures trips the circuit breaker:
   purchasing pauses, then one probe payment per exponentially doubled
   wait decides whether it resumes. The breaker lives in memory only: a
@@ -127,7 +133,7 @@ Whatever can reach `LISTEN_ADDR` can submit records and, with
 | Path | Meaning |
 |---|---|
 | `debts/<fp>` | owed fingerprint; written and fsynced before "received" goes out |
-| `debts/<fp>.l402` | in-flight purchase: the L402 challenge, plus the preimage once paid; `attempts` / `attention` once the gateway keeps refusing that preimage |
+| `debts/<fp>.l402` | in-flight purchase: the L402 challenge with the invoice's own `payment_hash` and `amount_sats` (decoded by phoenixd), plus the preimage once paid; `attempts` / `attention` once the gateway keeps refusing that preimage |
 | `proofs/<fp>.ots` | the proof: `pending` while its attestations name a calendar, `bitcoin_attestation_present` once an attestation node names a Bitcoin block (decided by deserialising the whole file, never by scanning its bytes) |
 | `pending/<fp>` | empty marker for a proof still waiting for its Bitcoin attestation, written and fsynced before the proof and removed once bytes with the attestation are on disk; the upgrader works from this index and never re-reads the proofs directory, and drops a marker whose proof is absent only when no debt, no sidecar and no buyer mid-way can still write it; every start reconciles the index against the proofs ("Recover") |
 | `ledger` | one line `YYYY-MM-DD SPENT_SATS` per UTC day: attempts, not successes |
@@ -233,8 +239,24 @@ under the fingerprint's lock, and a marker whose proof is absent is never
 dropped while a debt exists. Debts and sidecars carry everything across a
 death; there is no shutdown sequence.
 
-A stale unpaid challenge past `L402_EXPIRY_SECS` is abandoned and
-re-challenged, logged `rechallenge_after_unknown_payment …
+A sidecar holding an invoice and no preimage — the process died between
+the `payinvoice` call and its answer, or the call failed — is not re-paid
+on a guess. The wallet is asked first (`GET
+/payments/outgoingbyhash/<payment_hash>`, the hash stored in the sidecar
+at challenge time): a payment it reports succeeded is redeemed with the
+preimage it holds, logged `payment_reconciled`, nothing paid and nothing
+reserved; one still in flight, or a wallet that cannot say, waits
+(`payment_outcome_unknown … note=awaiting_wallet`); one it reports failed
+or never sent (204: phoenixd records an outgoing payment before it sends)
+is definitely unpaid, and the retry reserves today's budget (the same
+preflight, ceiling and ledger write as a fresh challenge, logged
+`payment_retry_reserved`) before paying the stored invoice again. Until
+2026-09-15 the retry paid against the reservation of the day the invoice
+was minted, so an invoice reserved yesterday could settle today with
+today's whole budget still open (review finding A7); the sidecars of
+that era carry no hash or amount and are decoded from their stored
+invoice first. A stale unpaid challenge past `L402_EXPIRY_SECS` is
+abandoned and re-challenged, logged `rechallenge_after_unknown_payment …
 note=possible_double_charge`: the one edge where a double charge cannot
 be ruled out.
 

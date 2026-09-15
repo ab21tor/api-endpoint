@@ -90,7 +90,13 @@ class FakeLightning:
     """Counts every /decodeinvoice and /payinvoice call. Invoices look like
     'lnfake:<sats>:<fp>:<n>' so amounts and fingerprints are recoverable.
     Preimage is sha256(invoice) — deterministic, so re-paying the same
-    invoice yields the same preimage (a settled invoice settles once).
+    invoice yields the same preimage (a settled invoice settles once) —
+    and the invoice's payment hash, which /decodeinvoice reports, is the
+    sha256 of that preimage, as on a real wallet. GET
+    /payments/outgoingbyhash/{hash} answers as phoenixd 0.8.0 does: the
+    settled record (isPaid true, preimage) for an invoice this wallet paid,
+    a completed unpaid record for one it refused, 204 for one it never
+    saw; lookup_down makes it answer 500 instead.
     Payments fail while their fingerprint is in fail_pay_fps; fail_next_pays
     fails the next N payments whatever the invoice, then settles."""
 
@@ -104,6 +110,10 @@ class FakeLightning:
         self.pay_delay = 0.0        # hold each payment open, so overlap would show
         self.inflight_pays = 0
         self.max_inflight_pays = 0  # the most payments ever open at once
+        self.settled = {}           # payment hash -> preimage
+        self.refused = set()        # payment hashes of failed attempts
+        self.lookups = []
+        self.lookup_down = False
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -121,6 +131,32 @@ class FakeLightning:
                 except OSError:
                     pass
 
+            def do_GET(self):
+                if self.headers.get("Authorization") != EXPECTED_AUTH:
+                    with outer.lock:
+                        outer.auth_failures += 1
+                    self._json(401, {"error": "bad auth"})
+                    return
+                prefix = "/payments/outgoingbyhash/"
+                if self.path.startswith(prefix):
+                    h = self.path[len(prefix):]
+                    with outer.lock:
+                        outer.lookups.append(h)
+                        if outer.lookup_down:
+                            self._json(500, {"error": "injected"})
+                        elif h in outer.settled:
+                            self._json(200, {"paymentHash": h, "preimage": outer.settled[h],
+                                             "isPaid": True, "completedAt": 1})
+                        elif h in outer.refused:
+                            self._json(200, {"paymentHash": h, "preimage": None,
+                                             "isPaid": False, "completedAt": 1})
+                        else:
+                            self.send_response(204)
+                            self.send_header("Content-Length", "0")
+                            self.end_headers()
+                    return
+                self._json(404, {})
+
             def do_POST(self):
                 if self.headers.get("Authorization") != EXPECTED_AUTH:
                     with outer.lock:
@@ -135,7 +171,8 @@ class FakeLightning:
                         outer.decode_calls.append(invoice)
                     parts = invoice.split(":")
                     if len(parts) == 4 and parts[0] == "lnfake":
-                        self._json(200, {"amountSat": int(parts[1])})
+                        self._json(200, {"amountSat": int(parts[1]),
+                                         "paymentHash": FakeLightning.payment_hash(invoice)})
                     else:
                         self._json(200, {"unparseable": True})
                     return
@@ -154,10 +191,13 @@ class FakeLightning:
                     with outer.lock:
                         outer.inflight_pays -= 1
                     if fail:
+                        with outer.lock:
+                            outer.refused.add(FakeLightning.payment_hash(invoice))
                         self._json(200, {"reason": "payment failed"})
                     else:
-                        self._json(200, {"paymentPreimage":
-                                         hashlib.sha256(invoice.encode()).hexdigest()})
+                        with outer.lock:
+                            outer.settled[FakeLightning.payment_hash(invoice)] = FakeLightning.preimage(invoice)
+                        self._json(200, {"paymentPreimage": FakeLightning.preimage(invoice)})
                     return
                 self._json(404, {})
 
@@ -165,6 +205,14 @@ class FakeLightning:
         self.server.daemon_threads = True
         self.port = self.server.server_address[1]
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    @staticmethod
+    def preimage(invoice):
+        return hashlib.sha256(invoice.encode()).hexdigest()
+
+    @staticmethod
+    def payment_hash(invoice):
+        return hashlib.sha256(bytes.fromhex(FakeLightning.preimage(invoice))).hexdigest()
 
     def shutdown(self):
         self.server.shutdown()
@@ -942,16 +990,19 @@ class TestBuyerPolicy(IntegrationBase):
         self.assertTrue(os.path.exists(self.debt_file(fp)))
         self.assertTrue(os.path.exists(self.sidecar_file(fp)))
         self.assertIn("payment_failed", self.read_service_log())
-        # Heal: the STORED invoice is retried — no fresh challenge, and the
-        # single reservation covers the single possible settlement.
+        # Heal: the STORED invoice is retried — no fresh challenge. The
+        # wallet is asked first and reports the attempt failed, so the retry
+        # is a second payinvoice call and reserves again: the budget counts
+        # calls, not invoices (2026-09-15 review, A7).
         challenges_before = self.gw.challenges_for(fp)
         self.ln.fail_pay_fps.discard(fp)
         self.wait_until(lambda: os.path.exists(self.proof_file(fp)),
                         what="proof after payment heals")
         self.assertEqual(self.gw.challenges_for(fp), challenges_before)
         self.assertEqual(len(self.ln.distinct_paid_invoices_for_fp(fp)), 1)
+        self.assertIn(FakeLightning.payment_hash(self.ln.pays_for_fp(fp)[0]), self.ln.lookups)
         day, spent = api_endpoint.read_ledger(self.data("ledger"))
-        self.assertEqual(spent, 10)
+        self.assertEqual(spent, 20)
 
     def test_exhausted_budget_makes_no_gateway_contact(self):
         """A box whose day is fully spent must not ask the gateway for

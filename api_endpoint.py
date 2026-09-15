@@ -835,10 +835,54 @@ def phoenixd_call(cfg, password, endpoint, bolt11, timeout):
         return None
 
 
+def decode_invoice(cfg, password, bolt11):
+    """(sats, payment_hash) from phoenixd's /decodeinvoice; either is None
+    when it could not be read — never pay an amount that could not be read,
+    never reconcile against a hash that was not the invoice's own."""
+    d = phoenixd_call(cfg, password, "/decodeinvoice", bolt11, timeout=15)
+    sats = amount_sats_from_decoded(d)
+    h = d.get("paymentHash") if isinstance(d, dict) else None
+    if isinstance(h, str) and HEX64.fullmatch(h.lower()):
+        return sats, h.lower()
+    return sats, None
+
+
 def decode_invoice_sats(cfg, password, bolt11):
     """None on any failure — never pay an amount that could not be read."""
-    return amount_sats_from_decoded(
-        phoenixd_call(cfg, password, "/decodeinvoice", bolt11, timeout=15))
+    return decode_invoice(cfg, password, bolt11)[0]
+
+
+def wallet_payment_outcome(cfg, password, payment_hash):
+    """What the wallet says became of an attempt to pay payment_hash, from
+    GET /payments/outgoingbyhash/{hash} (phoenixd 0.8.0 and 0.9.1: the best
+    record for that hash, 204 when there is none). Returns
+    ("paid", preimage)  — isPaid true with a 64-hex preimage whose sha256 is
+                          the hash;
+    ("failed", None)    — 204 (phoenixd records an outgoing payment before
+                          it sends, so no record means it never sent), or a
+                          completed record that is not paid;
+    ("unknown", None)   — a record still in flight, or an answer that is
+                          neither. Transport failures raise Unreachable."""
+    tok = base64.b64encode(b":" + password.encode()).decode("ascii")
+    status, _, body = http_get(cfg["phoenixd_url"] + "/payments/outgoingbyhash/" + payment_hash,
+                               timeout=20, headers={"Authorization": "Basic " + tok})
+    if status == 204:
+        return "failed", None
+    if status != 200:
+        return "unknown", None
+    try:
+        d = json.loads(body)
+    except ValueError:
+        return "unknown", None
+    if not isinstance(d, dict):
+        return "unknown", None
+    p = d.get("preimage")
+    if d.get("isPaid") is True and isinstance(p, str) and HEX64.fullmatch(p.lower()) \
+            and sha256(bytes.fromhex(p)).hexdigest() == payment_hash:
+        return "paid", p.lower()
+    if d.get("isPaid") is False and d.get("completedAt") is not None:
+        return "failed", None
+    return "unknown", None
 
 
 def pay_invoice(cfg, password, bolt11):
@@ -1118,11 +1162,19 @@ def load_sidecar(path):
     return {}, age
 
 
-def write_sidecar(path, macaroon, invoice, preimage=None, attempts=0, attention=None):
-    """The in-flight purchase record. attempts counts definite redeem
-    refusals of a paid preimage; attention is the UTC time the ceiling was
-    reached (the operator's signal: the box holds a paid, unredeemed proof)."""
+def write_sidecar(path, macaroon, invoice, preimage=None, attempts=0, attention=None,
+                  payment_hash=None, amount_sats=None):
+    """The in-flight purchase record. payment_hash and amount_sats (since
+    2026-09-15) are the invoice's own, decoded by phoenixd, so a retry can
+    ask the wallet what became of the payment and reserve the amount again;
+    attempts counts definite redeem refusals of a paid preimage; attention
+    is the UTC time the ceiling was reached (the operator's signal: the box
+    holds a paid, unredeemed proof)."""
     d = {"macaroon": macaroon, "invoice": invoice}
+    if isinstance(payment_hash, str):
+        d["payment_hash"] = payment_hash
+    if isinstance(amount_sats, int) and not isinstance(amount_sats, bool):
+        d["amount_sats"] = amount_sats
     if preimage:
         d["preimage"] = preimage
     if attempts:
@@ -1240,13 +1292,14 @@ def _redeem(cfg, fp, macaroon, preimage, amt, flags, sidecar=None):
     if sidecar is not None:
         try:
             write_sidecar(sidecar_path(cfg, fp), macaroon, sidecar.get("invoice", ""),
-                          preimage, attempts=attempts, attention=attention)
+                          preimage, attempts=attempts, attention=attention,
+                          payment_hash=sidecar.get("payment_hash"), amount_sats=sidecar.get("amount_sats"))
         except OSError:
             log_event(cfg, "cannot_write_sidecar", fp=fp)
     return True
 
 
-def _pay_and_redeem(cfg, password, fp, macaroon, invoice, amt, flags):
+def _pay_and_redeem(cfg, password, fp, macaroon, invoice, amt, flags, payment_hash=None):
     br = flags["breaker"]
     if br["open"]:
         # buyer_pass gates while the pause runs, so being here with the
@@ -1270,7 +1323,8 @@ def _pay_and_redeem(cfg, password, fp, macaroon, invoice, amt, flags):
         return _breaker_failed(cfg, br)
     _breaker_settled(cfg, br)
     try:
-        write_sidecar(sidecar_path(cfg, fp), macaroon, invoice, preimage)
+        write_sidecar(sidecar_path(cfg, fp), macaroon, invoice, preimage,
+                      payment_hash=payment_hash, amount_sats=amt)
     except OSError:
         # Still redeem now; if that fails too, the retry path re-pays this
         # same stored invoice and phoenixd's own dedupe is the last line.
@@ -1280,9 +1334,16 @@ def _pay_and_redeem(cfg, password, fp, macaroon, invoice, amt, flags):
 
 def finish_sidecar(cfg, password, fp, sc, age, flags):
     """Resume an in-flight purchase after a crash or failed attempt. With a
-    preimage: redeem only — never pay again. Without one: re-pay the STORED
-    invoice only, until L402_EXPIRY_SECS, then abandon the challenge loudly
-    (the one edge where a double charge cannot be ruled out)."""
+    preimage: redeem only — never pay again. Without one: the wallet is
+    asked first what became of the payment (settled: redeem with its
+    preimage, no payment, no reservation; unknown: wait); only a
+    definitely unpaid invoice is paid again, and it reserves TODAY's budget
+    before the payinvoice call — the budget counts every call, not every
+    invoice (2026-09-15 review, A7: an invoice reserved yesterday could
+    settle today with today's whole budget still open). The STORED invoice
+    is re-paid, never a fresh challenge, until L402_EXPIRY_SECS; then the
+    challenge is abandoned loudly (the one edge where a double charge cannot
+    be ruled out)."""
     macaroon, invoice, preimage = sc.get("macaroon"), sc.get("invoice"), sc.get("preimage")
 
     if isinstance(preimage, str) and isinstance(macaroon, str):
@@ -1296,7 +1357,7 @@ def finish_sidecar(cfg, password, fp, sc, age, flags):
 
     if isinstance(macaroon, str) and isinstance(invoice, str):
         if age <= cfg["l402_expiry_secs"]:
-            return _pay_and_redeem(cfg, password, fp, macaroon, invoice, None, flags)
+            return _retry_stored_invoice(cfg, password, fp, sc, macaroon, invoice, flags)
     else:
         if fp not in flags["corrupt_logged"]:
             flags["corrupt_logged"].add(fp)
@@ -1315,6 +1376,74 @@ def finish_sidecar(cfg, password, fp, sc, age, flags):
         pass
     flags["corrupt_logged"].discard(fp)
     return True
+
+
+def _retry_stored_invoice(cfg, password, fp, sc, macaroon, invoice, flags):
+    """A sidecar holding an invoice and no preimage: this process does not
+    know whether the earlier payinvoice call settled. The wallet does."""
+    payment_hash = sc.get("payment_hash") if isinstance(sc.get("payment_hash"), str) else None
+    amt = sc.get("amount_sats")
+    if not isinstance(amt, int) or isinstance(amt, bool):
+        amt = None
+    if payment_hash is None or amt is None:
+        # A sidecar from before 2026-09-15 carries neither: read them off the
+        # stored invoice itself.
+        try:
+            decoded_amt, decoded_hash = decode_invoice(cfg, password, invoice)
+        except Unreachable:
+            return _mark_down(cfg, flags, "phoenixd")
+        _mark_up(cfg, flags, "phoenixd")
+        amt = amt if amt is not None else decoded_amt
+        payment_hash = payment_hash or decoded_hash
+        if payment_hash is None or amt is None:
+            if fp not in flags["corrupt_logged"]:
+                flags["corrupt_logged"].add(fp)
+                log_event(cfg, "sidecar_needs_attention", fp=fp, note="stored_invoice_undecodable")
+            return True
+    try:
+        outcome, preimage = wallet_payment_outcome(cfg, password, payment_hash)
+    except Unreachable:
+        return _mark_down(cfg, flags, "phoenixd")
+    _mark_up(cfg, flags, "phoenixd")
+    if outcome == "paid":
+        # Settled at the wallet, answer lost: the preimage is stored and
+        # redeemed; nothing is paid and nothing reserved.
+        try:
+            write_sidecar(sidecar_path(cfg, fp), macaroon, invoice, preimage,
+                          payment_hash=payment_hash, amount_sats=amt)
+        except OSError:
+            log_event(cfg, "cannot_write_sidecar", fp=fp)
+        log_event(cfg, "payment_reconciled", fp=fp, sats=amt, note="settled_at_wallet")
+        flags["corrupt_logged"].discard(fp)
+        return _redeem(cfg, fp, macaroon, preimage, amt, flags, sidecar=sc)
+    if outcome == "unknown":
+        # Still in flight, or the wallet could not say: wait; never pay
+        # again on a guess.
+        if fp not in flags["corrupt_logged"]:
+            flags["corrupt_logged"].add(fp)
+            log_event(cfg, "payment_outcome_unknown", fp=fp, sats=amt, note="awaiting_wallet")
+        return True
+    flags["corrupt_logged"].discard(fp)
+    # Definitely unpaid: this retry is a payinvoice call, so it reserves
+    # today's budget first — the same preflight, ceiling and reservation as
+    # a fresh challenge, against today's ledger.
+    verdict, day, spent = _budget_preflight(cfg, flags)
+    if verdict != "ok":
+        return verdict == "skip"
+    today = utc_today()
+    already = spent if day == today else 0
+    remaining = cfg["daily_budget_sats"] - already
+    if amt > remaining:
+        log_event(cfg, "skip", fp=fp, reason="exceeds_daily_budget", amt=amt, remaining=remaining,
+                  note="retry_of_stored_invoice")
+        return True
+    try:
+        write_ledger(cfg["ledger_path"], today, already + amt)
+    except OSError:
+        log_event(cfg, "cannot_write_ledger", fp=fp)
+        return False
+    log_event(cfg, "payment_retry_reserved", fp=fp, sats=amt)
+    return _pay_and_redeem(cfg, password, fp, macaroon, invoice, amt, flags, payment_hash=payment_hash)
 
 
 def _budget_preflight(cfg, flags):
@@ -1441,7 +1570,7 @@ def _buy_challenged(cfg, password, fp, status, headers, body, day, spent, flags)
     # Ceiling and budget are enforced on the DECODED amount, never the
     # gateway's claim (the pay402 rule; fail closed when unreadable).
     try:
-        amt = decode_invoice_sats(cfg, password, invoice)
+        amt, payment_hash = decode_invoice(cfg, password, invoice)
     except Unreachable:
         return _mark_down(cfg, flags, "phoenixd")
     _mark_up(cfg, flags, "phoenixd")
@@ -1469,11 +1598,12 @@ def _buy_challenged(cfg, password, fp, status, headers, body, day, spent, flags)
         log_event(cfg, "cannot_write_ledger", fp=fp)
         return False
     try:
-        write_sidecar(sidecar_path(cfg, fp), macaroon, invoice)
+        write_sidecar(sidecar_path(cfg, fp), macaroon, invoice,
+                      payment_hash=payment_hash, amount_sats=amt)
     except OSError:
         log_event(cfg, "cannot_write_sidecar", fp=fp)
         return False
-    return _pay_and_redeem(cfg, password, fp, macaroon, invoice, amt, flags)
+    return _pay_and_redeem(cfg, password, fp, macaroon, invoice, amt, flags, payment_hash=payment_hash)
 
 
 def buyer_pass(cfg, password, flags):
