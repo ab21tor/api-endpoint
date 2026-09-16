@@ -195,8 +195,13 @@ op, the digest) and stores the result exactly as a free-door answer, with
 the same whole-proof check, pending marker, atomic write and
 `clear_debt`. The bytes are what the `ots` client writes for a single
 calendar; the parser that builds and later upgrades them is a copy of the
-one in the fork's `ops/selfstamp.py`, cross-checked against the
-opentimestamps library by both trees' tests. Answers that are not the
+one in the fork's `ops/selfstamp.py`, and both are held to one corpus of
+proof bytes (`proof_corpus.py`, the same file in both trees) against the
+opentimestamps library as the oracle: every byte consumed, every
+attestation payload consumed to its end, the library's size limits at
+their boundaries, and two stated narrowings (only `sha256`, `append` and
+`prepend`; a varuint of at most ten bytes). `docs/contracts.md`, "The
+proof parser", is the contract. Answers that are not the
 protocol are refused and the debt stays: a 402 (the URL points at a
 gateway) is `challenge_failed … note=calendar_answered_402` and touches no
 payment machinery; a 200 that is not a pending timestamp of this digest is
@@ -328,12 +333,19 @@ sequence. Every start, before the door opens, reconciles `DATA_DIR`
 (`reconciled …` in the log, with counts): each proof is deserialised
 whole; a `pending` proof without its marker gets it back
 (`pending_marker_restored`); a proof with a Bitcoin attestation loses a
-stale marker; bytes that are not one whole proof of their fingerprint are
-set aside as `<fp>.ots.invalid-<time>` and the debt re-created so the
-buyer fetches a proper proof (`proof_invalid_requeued`); a marker with
-neither proof nor debt is dropped. This repairs an installation stranded
-by the marker race or by a header-only "proof" that earlier releases
-accepted, whether or not `.built` exists. Then the buyer starts with the
+stale marker; bytes that are not one whole proof of their fingerprint
+get their debt re-created first, durably, and are then set aside as
+`<fp>.ots.invalid-<time>`, so the buyer fetches a proper proof
+(`proof_invalid_requeued`); an aside file found with neither a proof nor
+a debt for its fingerprint (left by the code before 2026-09-16, which
+moved the bytes before it wrote the debt) gets its debt back
+(`aside_requeued`); a marker with neither proof nor debt is dropped.
+Every step is idempotent, so a stop anywhere in the repair is repaired
+again the same way at the next start; a parser given any bytes answers
+`INVALID`, never an exception (2026-09-15/16 review F01, F13). This
+repairs an installation stranded by the marker race or by a header-only
+"proof" that earlier releases accepted, whether or not `.built` exists.
+Then the buyer starts with the
 breaker closed and the debts oldest first, resuming in-flight sidecars as
 above. What to keep is `DATA_DIR`: the proofs, the debts and sidecars,
 the pending markers, the ledger, and the log. The durability tests inject
@@ -415,13 +427,20 @@ third refused payment and freezes submissions
 strict positive integer defaulting to 1
 (`test_inflight_knob_strict_positive_int_default_one`).
 
-`test_review_fixes.py` holds the 2026-09-15 review's findings as
-regressions, each failing on the code before the fix: the structural
-states decided by attestation nodes and never by a byte scan; intake's
-per-fingerprint lock, directory-fsync errors propagated, short writes
-completed; the marker kept while a debt exists, fatal when it cannot be
-made, fsynced before the debt is cleared; header-only and trailing-byte
-answers refused; the startup reconciliation, on the objects and with the
+`test_review_fixes.py` holds the 2026-09-15 and 2026-09-16 reviews'
+findings as regressions, each failing on the code before the fix: the
+structural states decided by attestation nodes and never by a byte scan;
+intake's per-fingerprint lock, directory-fsync errors propagated, short
+writes completed; the marker kept while a debt exists, fatal when it
+cannot be made, fsynced before the debt is cleared; header-only and
+trailing-byte answers refused; the debt durable before an invalid proof
+is moved aside, and a stranded aside file requeued; a failed cleanup
+after a failed debt write logged (`debt_cleanup_failed`: the 500
+promises only that acceptance was not confirmed); a trailing fork
+marker and every attestation payload not consumed whole refused as
+`INVALID`, and `inspect_proof` never raising over thousands of mutated
+and random inputs; the smoke script naming only functions that exist;
+the startup reconciliation, on the objects and with the
 real service; and the quiet server on a client disconnect.
 
 `CALENDAR_URL`, against a fake calendar speaking the fork's protocol:
@@ -445,6 +464,15 @@ a non-linear proof keeps its marker
 (`test_calendar_mode_inflight_eight_hits_digest_once_per_fingerprint`); the
 proof bytes round-trip through the opentimestamps library where it is
 importable (`test_ots_parser_cross_checks_with_the_library`).
+
+`test_proof_corpus.py` runs the corpus in `proof_corpus.py` against
+both readers and, where the library is importable, against the library:
+what parses for one parses for the other, with the two narrowings named;
+every strict prefix and one-byte extension of every valid proof is
+invalid for both. The integration tests wait for the log line a
+transition ends with (`bought`, `proof_free`, `already_bought`,
+`bitcoin_attestation_present`), never for a file that appears midway
+(2026-09-15/16 review F22: assertions raced the proof's rename).
 
 The live smoke, `GATEWAY_URL=http://... ./smoke.sh`, buys exactly one
 proof through the whole door, debt, pay, proof path and leaves it in

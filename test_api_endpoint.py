@@ -743,6 +743,23 @@ class IntegrationBase(unittest.TestCase):
         except OSError:
             return "<no log>"
 
+    def wait_settled(self, fp, timeout=20):
+        """A debt is settled when the buyer has logged bought, proof_free or
+        already_bought for it: each is written after clear_debt, so the
+        proof, the debt and the sidecar are all in their final state. The
+        proof's rename comes earlier and is not the end of the transition
+        (2026-09-15/16 review F22: assertions raced it)."""
+        needles = tuple(f"{event} fp={fp}" for event in ("bought", "proof_free", "already_bought"))
+        self.wait_until(lambda: any(n in self.read_service_log() for n in needles),
+                        timeout=timeout, what=f"debt settled for {fp[:12]}")
+
+    def wait_anchored(self, fp, timeout=20):
+        """The upgrade is complete when bitcoin_attestation_present is
+        logged: written after the anchored bytes are on disk and the
+        marker is cleared."""
+        self.wait_until(lambda: f"bitcoin_attestation_present fp={fp}" in self.read_service_log(),
+                        timeout=timeout, what=f"proof anchored for {fp[:12]}")
+
     def wait_until(self, cond, timeout=20, what="condition"):
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -900,8 +917,7 @@ class TestDoor(IntegrationBase):
         self.assertIn("411", first_line)
         # All three accepted records end in proofs bought from the gateway.
         for f in (fp, dg, hashed):
-            self.wait_until(lambda f=f: os.path.exists(self.proof_file(f)),
-                            what=f"proof for {f[:12]}")
+            self.wait_settled(f)
             with open(self.proof_file(f), "rb") as fh:
                 self.assertEqual(fh.read(), pending_ots(f))
             self.assertFalse(os.path.exists(self.debt_file(f)))
@@ -1069,8 +1085,7 @@ class TestBuyerPolicy(IntegrationBase):
         self.assertTrue(os.path.exists(self.debt_file(fp)))
         # The day rolls: same spend, yesterday's date — today has headroom.
         api_endpoint.write_ledger(self.data("ledger"), "2000-01-01", 200000)
-        self.wait_until(lambda: os.path.exists(self.proof_file(fp)),
-                        what="proof after the day rolls")
+        self.wait_settled(fp)
         log = self.read_service_log()
         self.assertEqual(log.count("budget_resumed"), 1)
         self.assertEqual(log.count("budget_exhausted"), 1)
@@ -1132,8 +1147,7 @@ class TestCircuitBreaker(IntegrationBase):
             self.assertEqual(code, 200)
             fps.append(text.split()[1])
         for fp in fps:
-            self.wait_until(lambda fp=fp: os.path.exists(self.proof_file(fp)),
-                            what=f"proof for {fp[:12]}")
+            self.wait_settled(fp)
             self.assertFalse(os.path.exists(self.debt_file(fp)))
             self.assertFalse(os.path.exists(self.sidecar_file(fp)))
         # Both refusals really happened (or the test is vacuous), and each
@@ -1214,7 +1228,7 @@ class TestWrongDigestRefused(IntegrationBase):
         self.assertNotIn(fp, os.listdir(self.data("pending")))
         # The gateway recovers: the next answer is a proof of fp and is stored.
         self.gw.wrong_digest = False
-        self.wait_until(lambda: os.path.exists(self.proof_file(fp)), what="proof after recovery")
+        self.wait_settled(fp)
         with open(self.proof_file(fp), "rb") as f:
             self.assertEqual(api_endpoint.proof_digest(f.read()), fp)
         self.assertFalse(os.path.exists(self.debt_file(fp)))
@@ -1277,7 +1291,8 @@ class TestUpgrader(IntegrationBase):
             with open(self.proof_file(fp), "rb") as f:
                 return api_endpoint.bitcoin_attestation_present(f.read())
 
-        self.wait_until(proof_is_anchored, what="proof anchored on disk")
+        self.wait_anchored(fp)
+        self.assertTrue(proof_is_anchored())
         with open(self.proof_file(fp), "rb") as f:
             self.assertEqual(f.read(), anchored_ots(fp))
         self.assertIn("bitcoin_attestation_present fp=" + fp, self.read_service_log())
@@ -1424,8 +1439,7 @@ class TestRedeemCeiling(IntegrationBase):
         # The gateway accepts the token again (the rotation is reverted):
         # the next slow retry redeems, the proof lands, attention clears.
         self.gw.redeem_status_override = None
-        self.wait_until(lambda: os.path.exists(self.proof_file(fp)), timeout=30,
-                        what="proof after the gateway recovered")
+        self.wait_settled(fp, timeout=30)
         self.assertFalse(os.path.exists(self.sidecar_file(fp)))
         self.assertEqual(len(self.ln.pays_for_fp(fp)), 1)
         self.wait_until(lambda: "attention=0" in open(self.data("heartbeat")).read(),
@@ -1483,8 +1497,10 @@ class TestUpgradeBacklog(IntegrationBase):
         self.gw.anchor_now.update(fps)
         self.start_service(UPGRADE_SECS="0.2", GATEWAY_UPGRADE_TOKEN="upgrade-tok",
                            UPGRADE_INFLIGHT="8")
-        self.wait_until(lambda: all(api_endpoint.bitcoin_attestation_present(open(self.proof_file(fp), "rb").read())
-                                    for fp in fps), timeout=30, what="every pending proof anchored")
+        for fp in fps:
+            self.wait_anchored(fp, timeout=30)
+        self.assertTrue(all(api_endpoint.bitcoin_attestation_present(open(self.proof_file(fp), "rb").read())
+                            for fp in fps))
         self.assertEqual(self.pending_index(), [])
         log = self.read_service_log()
         self.assertNotIn("upgrade_rate_limited", log)
@@ -1730,9 +1746,13 @@ class TestInflight(IntegrationBase):
         self.assertGreaterEqual(self.gw.max_inflight_total, 2, "never concurrent")
         self.assertEqual(self.gw.max_inflight_fp, 1)
         # Exactly one of everything per paid debt; nothing for the free ones.
+        # A lost answer (an unreachable door mid-pass) makes a debt owed
+        # again next pass, by contract; that is not this scenario, and a
+        # run that met one says so instead of failing a count in silence.
+        self.assertNotIn("_unreachable", log, "a transport failure occurred in this run:\n" + log)
         for fp in fps:
             self.assertEqual(self.gw.challenges_for(fp), 1,
-                             "a collected 402 was submitted again")
+                             "a collected 402 was submitted again:\n" + log)
         self.assertEqual(len(self.gw.minted), 7)
         with self.gw.lock:
             redeems = list(self.gw.redeems)

@@ -518,3 +518,172 @@ class TestOldSidecarReservation(UnitBase):
             self.assertEqual(a.wallet_payment_outcome(self.cfg, "pw", h), ("unknown", None))
         with patch.object(a, "http_get", return_value=(500, {}, b"boom")):
             self.assertEqual(a.wallet_payment_outcome(self.cfg, "pw", h), ("unknown", None))
+
+
+class TestReconciliationOrder(UnitBase):
+    """F01 (2026-09-15/16 review): the reconciliation moved an invalid
+    proof aside and only then wrote the debt. A failed debt write, or a
+    stop between the two, left an aside file nobody reads and no debt: a
+    promised proof, lost. Now the debt is durable before the bytes move,
+    and an aside file found alone recreates the debt. Exception injection
+    at the write boundary; not a power cut."""
+
+    def aside_files(self):
+        return sorted(p.name for p in Path(self.cfg["proofs_dir"]).iterdir() if ".ots.invalid-" in p.name)
+
+    def test_the_debt_is_durable_before_an_invalid_proof_is_moved_aside(self):
+        Path(a.proof_path(self.cfg, self.fp)).write_bytes(b"invalid older proof")
+        with patch.object(a, "write_debt", side_effect=OSError(errno.ENOSPC, "synthetic ENOSPC")):
+            with self.assertRaises(OSError):
+                a.reconcile_state(self.cfg)
+        self.assertTrue(self.exists("proof"), "nothing moved while the debt could not be written")
+        self.assertEqual(self.aside_files(), [])
+        counts = a.reconcile_state(self.cfg)          # storage back: the next start repairs it
+        self.assertEqual(counts.get("invalid_requeued"), 1, counts)
+        self.assertTrue(self.exists("debt"))
+        self.assertFalse(self.exists("proof"))
+        self.assertEqual(len(self.aside_files()), 1)
+        self.assertEqual(a.list_debts_oldest_first(self.cfg), [self.fp])
+
+    def test_the_debt_is_fsynced_before_the_bytes_move(self):
+        Path(a.proof_path(self.cfg, self.fp)).write_bytes(b"invalid older proof")
+        events = []
+        real_fsync, real_replace = os.fsync, os.replace
+
+        def record_fsync(fd):
+            st = os.fstat(fd)
+            if stat.S_ISDIR(st.st_mode) and os.path.samestat(st, os.stat(self.cfg["debts_dir"])):
+                events.append("debts_dir_fsync")
+            return real_fsync(fd)
+
+        def record_replace(src, dst):
+            if src == a.proof_path(self.cfg, self.fp):
+                events.append("moved_aside")
+            return real_replace(src, dst)
+        with patch.object(a.os, "fsync", record_fsync), patch.object(a.os, "replace", record_replace):
+            a.reconcile_state(self.cfg)
+        self.assertIn("debts_dir_fsync", events)
+        self.assertIn("moved_aside", events)
+        self.assertLess(events.index("debts_dir_fsync"), events.index("moved_aside"))
+
+    def test_a_stranded_aside_file_recreates_the_debt(self):
+        Path(self.cfg["proofs_dir"], self.fp + ".ots.invalid-1700000000").write_bytes(b"x")
+        counts = a.reconcile_state(self.cfg)
+        self.assertEqual(counts, {"aside_requeued": 1})
+        self.assertTrue(self.exists("debt"))
+        self.assertIn("aside_requeued fp=" + self.fp, self.log())
+        self.assertEqual(a.reconcile_state(self.cfg), {}, "a second pass finds nothing to do")
+        # With a whole proof beside it the aside file is history, not a debt.
+        other = "bb" * 32
+        Path(self.cfg["proofs_dir"], other + ".ots.invalid-1700000000").write_bytes(b"x")
+        Path(a.proof_path(self.cfg, other)).write_bytes(anchored(other))
+        self.assertEqual(a.reconcile_state(self.cfg), {})
+        self.assertFalse(self.exists("debt", other))
+
+
+class TestParserBounds(UnitBase):
+    """F13 and F03 (2026-09-15/16 review): a final fork marker indexed
+    past the end and raised IndexError out of the startup reconciliation;
+    attestation payloads were read for their first field only, so bytes
+    the public client refuses cleared debts. inspect_proof never raises,
+    and every payload is consumed to its end."""
+
+    def test_a_trailing_fork_marker_is_invalid_not_a_crash(self):
+        data = a.OTS_MAGIC + b"\x01\x08" + bytes.fromhex(self.fp) + b"\xff"
+        self.assertEqual(a.inspect_proof(data, self.fp)[0], a.INVALID)
+        Path(a.proof_path(self.cfg, self.fp)).write_bytes(data)
+        counts = a.reconcile_state(self.cfg)
+        self.assertEqual(counts.get("invalid_requeued"), 1, counts)
+        self.assertTrue(self.exists("debt"))
+
+    def test_attestation_payloads_are_consumed_whole(self):
+        head = a.OTS_MAGIC + b"\x01\x08" + bytes.fromhex(self.fp)
+        uri = b"http://127.0.0.1:14788/"
+        cases = {
+            "bitcoin_payload_trailing_byte": head + b"\x00" + BITCOIN_TAG + b"\x02\x01\x00",
+            "bitcoin_payload_empty": head + b"\x00" + BITCOIN_TAG + b"\x00",
+            "pending_payload_trailing_byte": head + b"\x00" + PENDING_TAG
+                + a.varuint(len(uri) + 2) + a.varuint(len(uri)) + uri + b"\x00",
+            "pending_uri_invalid_utf8": head + b"\x00" + PENDING_TAG + b"\x02\x01\xff",
+            "pending_uri_disallowed_character": head + b"\x00" + PENDING_TAG
+                + a.varuint(len(uri) + 2) + a.varuint(len(uri) + 1) + uri + b" ",
+        }
+        for name, data in cases.items():
+            with self.subTest(name):
+                self.assertEqual(a.inspect_proof(data, self.fp)[0], a.INVALID)
+                with self.assertRaises(a.OtsError):
+                    a.parse_ots(data)
+                # The free door and the paid redeem refuse them: the debt stays.
+                a.write_debt(self.cfg, self.fp)
+                a._buy_challenged(self.cfg, None, self.fp, 200, {}, data, a.utc_today(), 0, flags())
+                self.assertFalse(self.exists("proof"))
+                self.assertTrue(self.exists("debt"))
+                a.clear_debt(self.cfg, self.fp)
+
+    def test_inspect_proof_never_raises(self):
+        import random
+        rng = random.Random(20260916)
+        shapes = [pending(self.fp), anchored(self.fp), forked(self.fp)]
+        for data in shapes:
+            for cut in range(len(data) + 1):
+                self.assertIsInstance(a.inspect_proof(data[:cut], self.fp), tuple)
+            self.assertEqual(a.inspect_proof(data + b"\x00", self.fp)[0], a.INVALID)
+        for _ in range(3000):
+            data = bytearray(rng.choice(shapes))
+            for _ in range(rng.randint(1, 3)):
+                kind = rng.random()
+                pos = rng.randrange(len(data)) if data else 0
+                if kind < 0.5 and data:
+                    data[pos] = rng.randrange(256)
+                elif kind < 0.8:
+                    data.insert(pos, rng.randrange(256))
+                elif data:
+                    del data[pos]
+            self.assertIsInstance(a.inspect_proof(bytes(data), self.fp), tuple)
+        for _ in range(500):
+            self.assertIsInstance(a.inspect_proof(rng.randbytes(rng.randrange(0, 200)), self.fp), tuple)
+
+
+class TestSmoke(unittest.TestCase):
+    """F21 (2026-09-15/16 review): the smoke script called
+    api_endpoint.is_anchored, removed on 2026-09-15."""
+
+    def test_the_smoke_script_names_only_functions_that_exist(self):
+        import re
+        source = Path(__file__).with_name("smoke.sh").read_text()
+        # The file name api_endpoint.py is not a reference to a function.
+        names = sorted(set(re.findall(r"api_endpoint\.([A-Za-z_][A-Za-z0-9_]*)", source)) - {"py"})
+        missing = [n for n in names if not hasattr(a, n)]
+        self.assertEqual(missing, [], "smoke.sh names functions the adapter no longer has")
+        self.assertIn("inspect_proof", names, "the smoke must check the whole proof, not its header")
+        self.assertNotIn("is_anchored", names)
+
+
+class TestIntakeCleanup(UnitBase):
+    """Close-gate correction (2026-09-16): a debt that could not be made
+    durable is removed and the door answers 500, but the removal can fail
+    too, and its error was suppressed. The 500 therefore promises only
+    that acceptance was not confirmed; a debt file may remain, which is
+    the safe direction (the buyer meets it, the client's retry is answered
+    received). The leftover is now logged, so the state is observable."""
+
+    def test_a_failed_cleanup_after_a_failed_debt_write_is_logged_and_the_error_still_raised(self):
+        real_fsync, real_unlink = os.fsync, os.unlink
+
+        def failed_file_sync(fd):
+            if not stat.S_ISDIR(os.fstat(fd).st_mode):
+                raise OSError(errno.EIO, "injected debt fsync failure")
+            return real_fsync(fd)
+
+        def failed_unlink(path):
+            if path == a.debt_path(self.cfg, self.fp):
+                raise OSError(errno.EIO, "injected unlink failure")
+            return real_unlink(path)
+        with patch.object(a.os, "fsync", failed_file_sync), patch.object(a.os, "unlink", failed_unlink):
+            with self.assertRaises(OSError):
+                a.write_debt(self.cfg, self.fp)
+        self.assertTrue(self.exists("debt"), "the leftover the door could not remove")
+        self.assertIn("debt_cleanup_failed fp=" + self.fp, self.log())
+        # The leftover is a debt like any other: the buyer meets it, and a
+        # duplicate request is answered as already owed.
+        self.assertFalse(a.write_debt(self.cfg, self.fp))

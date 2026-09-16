@@ -57,8 +57,9 @@ BITCOIN_ATTESTATION = b"\x00" + BITCOIN_TAG
 # OpenTimestamps proof bytes, the subset a single calendar emits — a COPY of
 # the parser in the fork's ops/selfstamp.py (2026-09-11), kept here because
 # this file is one stdlib file with no sibling to import from. The two
-# copies are cross-checked against the opentimestamps library by their
-# tests where it is importable; a change to one is a change to both.
+# copies are held to the same corpus (proof_corpus.py) against the
+# opentimestamps library by their tests; a change to one is a change to
+# both. docs/contracts.md, "The proof parser": what "parses" means here.
 OTS_VERSION = 1
 OP_SHA256 = 0x08
 OP_APPEND = 0xF0
@@ -67,11 +68,25 @@ ATTESTATION_MARKER = 0x00
 FORK_MARKER = 0xFF
 PENDING_TAG = bytes.fromhex("83dfe30d2ef90c8e")
 
+# The public client's limits (opentimestamps 0.4.x: core/op.py,
+# core/notary.py, core/timestamp.py), mirrored so that "parses" means the
+# same here as there. The last one is ours: the client reads a varuint of
+# any length; nothing valid needs more than ten bytes.
+MAX_OPERAND = 4096              # Op.MAX_RESULT_LENGTH: an append/prepend operand is 1..4096 bytes
+MAX_MSG = 4096                  # Op.MAX_MSG_LENGTH: no message on a path is longer
+MAX_ATTESTATION_PAYLOAD = 8192  # TimeAttestation.MAX_PAYLOAD_SIZE
+MAX_URI = 1000                  # PendingAttestation.MAX_URI_LENGTH
+URI_CHARS = frozenset(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._/:")
+MAX_OPS_ON_A_PATH = 255         # Timestamp.deserialize's recursion limit (256 levels)
+MAX_VARUINT_BYTES = 10
+
 Proof = collections.namedtuple("Proof", "digest commitment attestation ops_end")
 
 
 class OtsError(Exception):
-    """A proof this adapter cannot read or must not write."""
+    """A proof this adapter cannot read or must not write. The only error
+    the readers below raise, whatever the bytes (2026-09-15/16 review
+    F13: an IndexError escaped and stopped the startup reconciliation)."""
 
 
 def varuint(n):
@@ -89,9 +104,12 @@ def varuint(n):
 def read_varuint(data, pos):
     value = 0
     shift = 0
+    start = pos
     while True:
         if pos >= len(data):
             raise OtsError("truncated varuint")
+        if pos - start >= MAX_VARUINT_BYTES:
+            raise OtsError("varuint longer than %d bytes" % MAX_VARUINT_BYTES)
         byte = data[pos]
         pos += 1
         value |= (byte & 0x7F) << shift
@@ -100,11 +118,60 @@ def read_varuint(data, pos):
             return value, pos
 
 
-def read_varbytes(data, pos):
+def read_varbytes(data, pos, max_len, min_len=0):
     length, pos = read_varuint(data, pos)
+    if length > max_len:
+        raise OtsError("varbytes longer than %d bytes" % max_len)
+    if length < min_len:
+        raise OtsError("varbytes shorter than %d byte" % min_len)
     if pos + length > len(data):
         raise OtsError("truncated varbytes")
     return data[pos:pos + length], pos + length
+
+
+def read_attestation(data, pos):
+    """The attestation whose marker byte was just read: (kind, value, end).
+    A known payload is consumed to its last byte (2026-09-15/16 review F03:
+    a byte after the height, or no height at all, used to pass); a pending
+    URI is at most MAX_URI bytes of URI_CHARS; an unknown tag is kept as
+    ("unknown", tag hex), which parses and is no usable attestation."""
+    atag = data[pos:pos + 8]
+    if len(atag) != 8:
+        raise OtsError("truncated attestation tag")
+    pos += 8
+    payload, pos = read_varbytes(data, pos, MAX_ATTESTATION_PAYLOAD)
+    if atag == PENDING_TAG:
+        uri, end = read_varbytes(payload, 0, MAX_URI)
+        if end != len(payload):
+            raise OtsError("trailing bytes in the pending attestation")
+        if any(b not in URI_CHARS for b in uri):
+            raise OtsError("pending uri has a character outside the allowed set")
+        return "pending", uri.decode("ascii"), pos
+    if atag == BITCOIN_TAG:
+        height, end = read_varuint(payload, 0)
+        if end != len(payload):
+            raise OtsError("trailing bytes in the bitcoin attestation")
+        return "bitcoin", height, pos
+    return "unknown", atag.hex(), pos
+
+
+def _apply_op(tag, msg, data, pos):
+    """One operation on msg, within the public client's limits: (new msg, pos)."""
+    if len(msg) > MAX_MSG:
+        raise OtsError("message longer than %d bytes" % MAX_MSG)
+    if tag == OP_SHA256:
+        new = sha256(msg).digest()
+    elif tag == OP_APPEND:
+        operand, pos = read_varbytes(data, pos, MAX_OPERAND, min_len=1)
+        new = msg + operand
+    elif tag == OP_PREPEND:
+        operand, pos = read_varbytes(data, pos, MAX_OPERAND, min_len=1)
+        new = operand + msg
+    else:
+        raise OtsError("unsupported op 0x%02x" % tag)
+    if len(new) > MAX_OPERAND:
+        raise OtsError("result longer than %d bytes" % MAX_OPERAND)
+    return new, pos
 
 
 def parse_ots(data):
@@ -128,42 +195,23 @@ def parse_ots(data):
         raise OtsError("truncated digest")
     pos += 32
     msg = digest
+    ops = 0
     while True:
         if pos >= len(data):
             raise OtsError("truncated: no attestation")
         tag = data[pos]
         if tag == ATTESTATION_MARKER:
             ops_end = pos
-            pos += 1
-            atag = data[pos:pos + 8]
-            if len(atag) != 8:
-                raise OtsError("truncated attestation tag")
-            pos += 8
-            payload, pos = read_varbytes(data, pos)
-            if atag == PENDING_TAG:
-                uri, _ = read_varbytes(payload, 0)
-                attestation = ("pending", uri.decode("utf-8"))
-            elif atag == BITCOIN_TAG:
-                height, _ = read_varuint(payload, 0)
-                attestation = ("bitcoin", height)
-            else:
-                attestation = ("unknown", atag.hex())
+            kind, value, pos = read_attestation(data, pos + 1)
             if pos != len(data):
                 raise OtsError("trailing bytes after the attestation")
-            return Proof(digest, msg, attestation, ops_end)
+            return Proof(digest, msg, (kind, value), ops_end)
         if tag == FORK_MARKER:
             raise OtsError("non-linear timestamp (fork marker); use the ots client")
-        pos += 1
-        if tag == OP_SHA256:
-            msg = sha256(msg).digest()
-        elif tag == OP_APPEND:
-            operand, pos = read_varbytes(data, pos)
-            msg = msg + operand
-        elif tag == OP_PREPEND:
-            operand, pos = read_varbytes(data, pos)
-            msg = operand + msg
-        else:
-            raise OtsError("unsupported op 0x%02x" % tag)
+        msg, pos = _apply_op(tag, msg, data, pos + 1)
+        ops += 1
+        if ops > MAX_OPS_ON_A_PATH:
+            raise OtsError("more than %d operations on one path" % MAX_OPS_ON_A_PATH)
 
 
 def build_ots(digest, calendar_response):
@@ -203,50 +251,22 @@ PENDING = "pending"                                           # only pending att
 INVALID = "invalid"                                           # not a whole proof, or not of this fingerprint
 
 
-def _walk_timestamp(data, pos, out):
-    """One timestamp: zero or more fork-marked branches, then a last branch."""
-    while True:
-        if pos >= len(data):
-            raise OtsError("truncated: no attestation")
-        if data[pos] == FORK_MARKER:
-            pos = _walk_branch(data, pos + 1, out)
-            continue
-        return _walk_branch(data, pos, out)
-
-
-def _walk_branch(data, pos, out):
-    tag = data[pos]
-    pos += 1
-    if tag == ATTESTATION_MARKER:
-        atag = data[pos:pos + 8]
-        if len(atag) != 8:
-            raise OtsError("truncated attestation tag")
-        pos += 8
-        payload, pos = read_varbytes(data, pos)
-        if atag == PENDING_TAG:
-            uri, _ = read_varbytes(payload, 0)
-            out.append(("pending", uri.decode("utf-8", "replace")))
-        elif atag == BITCOIN_TAG:
-            height, _ = read_varuint(payload, 0)
-            out.append(("bitcoin", height))
-        else:
-            out.append(("unknown", atag.hex()))
-        return pos
-    if tag == OP_SHA256:
-        pass
-    elif tag in (OP_APPEND, OP_PREPEND):
-        _, pos = read_varbytes(data, pos)
-    else:
-        raise OtsError("unsupported op 0x%02x" % tag)
-    return _walk_timestamp(data, pos, out)
-
-
 def proof_attestations(data):
     """Every attestation node of a detached proof, forks included (a proof
     the gateway upgraded keeps its pending attestation beside the Bitcoin
     path), once the whole file has been walked: (digest hex, [(kind,
-    value), ...]). Raises OtsError on anything that is not one complete
-    proof: bad magic, an unknown op, truncation, trailing bytes."""
+    value), ...]). Raises OtsError, and only OtsError, on anything that is
+    not one complete proof by the public client's rules: bad magic, an
+    unknown op, truncation, trailing bytes, a payload not consumed whole,
+    a limit exceeded.
+
+    The walk is a loop, not a recursion: a timestamp is zero or more
+    fork-marked branches then a last branch, and a branch is an operation
+    followed by a timestamp, or an attestation. Every fork marker promises
+    one more branch of the same timestamp after the branch it opens ends,
+    so `pending` holds, per open fork, the message length and operation
+    count the sibling branch resumes with; an attestation ends a branch,
+    and the whole proof when no fork is open."""
     if data[:len(OTS_MAGIC)] != OTS_MAGIC:
         raise OtsError("not an OpenTimestamps proof (bad magic)")
     pos = len(OTS_MAGIC)
@@ -261,8 +281,42 @@ def proof_attestations(data):
         raise OtsError("truncated digest")
     pos += 32
     out = []
-    end = _walk_timestamp(data, pos, out)
-    if end != len(data):
+    pending = []
+    msg_len, ops, after_fork = 32, 0, False
+    while True:
+        if pos >= len(data):
+            raise OtsError("truncated: no attestation")
+        tag = data[pos]
+        pos += 1
+        if tag == FORK_MARKER:
+            if after_fork:
+                raise OtsError("a fork marker followed by another fork marker")
+            pending.append((msg_len, ops))
+            after_fork = True
+            continue
+        after_fork = False
+        if tag == ATTESTATION_MARKER:
+            kind, value, pos = read_attestation(data, pos)
+            out.append((kind, value))
+            if not pending:
+                break
+            msg_len, ops = pending.pop()
+            continue
+        if msg_len > MAX_MSG:
+            raise OtsError("message longer than %d bytes" % MAX_MSG)
+        if tag == OP_SHA256:
+            msg_len = 32
+        elif tag in (OP_APPEND, OP_PREPEND):
+            operand, pos = read_varbytes(data, pos, MAX_OPERAND, min_len=1)
+            msg_len += len(operand)
+        else:
+            raise OtsError("unsupported op 0x%02x" % tag)
+        if msg_len > MAX_OPERAND:
+            raise OtsError("result longer than %d bytes" % MAX_OPERAND)
+        ops += 1
+        if ops > MAX_OPS_ON_A_PATH:
+            raise OtsError("more than %d operations on one path" % MAX_OPS_ON_A_PATH)
+    if pos != len(data):
         raise OtsError("trailing bytes after the proof")
     return digest.hex(), out
 
@@ -923,8 +977,9 @@ def write_debt(cfg, fp):
     directory fsync, so a duplicate request is answered only once the
     original is durable or gone: filename existence alone is never an
     acknowledgement. A debt that cannot be made durable (a write, file
-    fsync or directory fsync error) is removed and the error raised; the
-    door answers 500, no promise. Must complete before 'received' goes
+    fsync or directory fsync error) is removed if it can be and the error
+    raised; the door answers 500: acceptance not confirmed, retry safely,
+    a debt may nonetheless remain. Must complete before 'received' goes
     out — the debt is the promise."""
     path = debt_path(cfg, fp)
     with fp_lock(fp):
@@ -940,10 +995,15 @@ def write_debt(cfg, fp):
                 os.close(fd)
             fsync_dir(cfg["debts_dir"])
         except OSError:
+            # The removal can fail too. Then a debt file remains behind a
+            # 500: the buyer meets it and a retry is answered as owed,
+            # which is the safe direction. Logged, so the state is seen;
+            # the 500 promises only that acceptance was not confirmed
+            # (docs/contracts.md, "What an HTTP success promises").
             try:
                 os.unlink(path)
-            except OSError:
-                pass
+            except OSError as exc:
+                log_event(cfg, "debt_cleanup_failed", fp=fp, err=type(exc).__name__)
             raise
         return True
 
@@ -1088,12 +1148,15 @@ def reconcile_state(cfg):
     2026-09-15, .built or not) is repaired. Each proof is deserialised
     whole: a PENDING proof without a marker gets one back
     (`pending_marker_restored`); a proof with a Bitcoin attestation loses a
-    stale marker; INVALID bytes are set aside as <fp>.ots.invalid-<time>
-    and the debt re-created so the buyer fetches a proper proof
-    (`proof_invalid_requeued`). A marker with neither proof nor debt nor
-    sidecar is dropped. A data directory from before the index (.built
-    absent) gets its markers here, logged once as `pending_index_built`.
-    Returns the counts."""
+    stale marker; INVALID bytes get their debt re-created first and are
+    then set aside as <fp>.ots.invalid-<time>, so the buyer fetches a
+    proper proof (`proof_invalid_requeued`); an aside file left alone by
+    an earlier version gets its debt back (`aside_requeued`). A marker
+    with neither proof nor debt nor sidecar is dropped. A data directory
+    from before the index (.built absent) gets its markers here, logged
+    once as `pending_index_built`. Every step is idempotent: a stop
+    anywhere leaves a state the next start repairs the same way. Returns
+    the counts."""
     counts = collections.Counter()
     first_index = not os.path.exists(os.path.join(cfg["pending_dir"], PENDING_BUILT))
     scanned = pending = 0
@@ -1120,12 +1183,29 @@ def reconcile_state(cfg):
                     log_event(cfg, "pending_marker_restored", fp=fp)
                     counts["markers_restored"] += 1
         else:
+            # The debt first: it is the promise, made durable (file and
+            # directory fsynced) before the bytes that failed to be a
+            # proof are moved out of the way. A stop or a failed write
+            # between the two leaves the invalid proof in place, found
+            # again next start; never an aside file alone (2026-09-15/16
+            # review F01).
+            write_debt(cfg, fp)
             aside = path + ".invalid-%d" % int(time.time())
             os.replace(path, aside)
             pending_clear(cfg, fp)
-            write_debt(cfg, fp)
             log_event(cfg, "proof_invalid_requeued", fp=fp, reason=reason)
             counts["invalid_requeued"] += 1
+    # An aside file with neither a proof nor a debt for its fingerprint:
+    # the code before 2026-09-16 moved the bytes before it wrote the debt
+    # and stopped between the two. The bytes were once stored as this
+    # fingerprint's proof, so the record was acknowledged; the debt is
+    # recreated and the buyer fetches a proper proof.
+    for fp in sorted({name[:64] for name in os.listdir(cfg["proofs_dir"])
+                      if HEX64.fullmatch(name[:64]) and name[64:].startswith(".ots.invalid-")}):
+        if not (os.path.exists(proof_path(cfg, fp)) or os.path.exists(debt_path(cfg, fp))):
+            write_debt(cfg, fp)
+            log_event(cfg, "aside_requeued", fp=fp)
+            counts["aside_requeued"] += 1
     for fp in list_pending(cfg):
         if not (os.path.exists(proof_path(cfg, fp)) or os.path.exists(debt_path(cfg, fp))
                 or os.path.exists(sidecar_path(cfg, fp))):

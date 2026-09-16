@@ -77,9 +77,10 @@ import api_endpoint
 fp = sys.argv[1]
 with open(f"proofs/{fp}.ots", "rb") as f:
     data = f.read()
-assert api_endpoint.looks_like_ots(data), "proof does not start with the OTS magic"
-print(f"proof: proofs/{fp}.ots ({len(data)} bytes, well-formed OTS)")
-print(f"anchored: {api_endpoint.is_anchored(data)} (pending is the pass)")
+state, reason = api_endpoint.inspect_proof(data, fp)
+assert state != api_endpoint.INVALID, f"proofs/{fp}.ots is not one whole proof of the fingerprint: {reason}"
+print(f"proof: proofs/{fp}.ots ({len(data)} bytes, one whole proof of the fingerprint)")
+print(f"state: {state} (pending is the pass; bitcoin_attestation_present arrives later through the upgrader)")
 EOF
 [ $? -eq 0 ] || exit 5
 
