@@ -15,9 +15,10 @@ One door, chosen by which URL is set; exactly one of the two.
 
 - **`GATEWAY_URL`**: the proof comes from an L402 timestamp gateway (the
   `timestamp-gateway` repository), through its 402 flow, paid from a
-  phoenixd on this host, or handed over by the gateway's free door; the
-  gateway's anchor bills are then settled by a standing payer (the
-  `auto-anchor` repository).
+  phoenixd on this host. The gateway's free door, its anchor billing and
+  the standing payer that settled those bills (once in the `auto-anchor`
+  repository) were retired on 2026-09-18; the adapter still stores a 200
+  that carries a proof, which is what the calendar answers.
 - **`CALENDAR_URL`**: the fingerprint is submitted directly to a calendar
   (the `opentimestamps-server` fork) through its counted `/digest`, and
   nothing is paid anywhere. The fork's README, "Install: single host",
@@ -36,7 +37,9 @@ Each rule is made by the code and pinned by the tests "Tests" names.
   the fingerprint's lock, so a duplicate request is answered only once
   the original is durable or gone; a debt that cannot be written or
   synced (its directory included) is removed, and the reply is a 500 and
-  no promise ("The door").
+  no promise ("The door"). A debt found already on file is fsynced
+  again, with its directory, before it is answered as owed: a file's
+  presence is never the acknowledgement, the barrier is.
 - A fingerprint is in flight at most once, and payments are never
   concurrent ("Concurrency").
 - The budget counts attempts, not successes: spend is recorded, against
@@ -59,7 +62,7 @@ Each rule is made by the code and pinned by the tests "Tests" names.
   expiry ("The debt lifecycle").
 - A proof is stored only if it deserialises whole, its attestation nodes
   inspected, and is a proof of the fingerprint this adapter asked for, on
-  the free door, on a paid redeem and on an upgrade alike; anything else
+  a 200 that carries a proof, on a paid redeem and on an upgrade alike; anything else
   is refused and logged `proof_wrong_digest` or `proof_invalid`, and the
   debt stays. Its pending marker is on disk (directory fsynced) before
   the proof, and if the marker cannot be made nothing is stored.
@@ -83,6 +86,8 @@ Each rule is made by the code and pinned by the tests "Tests" names.
 ## Requirements
 
 - `python3`; the adapter imports nothing outside the standard library.
+  The tests need the `opentimestamps` package as well: it is the parser
+  corpus's oracle, and the suite fails without it rather than skipping.
 - With `GATEWAY_URL`: a phoenixd on this host that pays the invoices, and
   its `phoenix.conf` readable by the adapter (the full `http-password`;
   paying needs it).
@@ -148,7 +153,7 @@ defaults.
 | Setting | Default | Meaning |
 |---|---|---|
 | `LISTEN_ADDR` | (required) | host:port of the door, e.g. `127.0.0.1:8402` |
-| `GATEWAY_URL` | one of the two | the L402 timestamp gateway this adapter gets proofs from (paid or free door) |
+| `GATEWAY_URL` | one of the two | the L402 timestamp gateway this adapter buys proofs from |
 | `CALENDAR_URL` | one of the two | the calendar this adapter submits to directly, e.g. `http://127.0.0.1:14788`. Exactly one of `GATEWAY_URL` and `CALENDAR_URL` is set; both or neither is a startup error naming both |
 | `MAX_PRICE_SATS` | 5000 | refuse any single quote above this |
 | `DAILY_BUDGET_SATS` | 200000 | refuse to exceed this per UTC day |
@@ -168,6 +173,11 @@ defaults.
 | `REDEEM_ATTENTION_RETRY_SECS` | 3600 | how often a needs-attention sidecar is retried after that |
 | `LOG_CAP_BYTES` | 16777216 | once `log` reaches this many bytes the next event renames it to `log.1` (replacing any previous `.1`) and starts fresh; 0 never rotates |
 
+Every interval (`POLL_SECS`, `UPGRADE_SECS`, `HEARTBEAT_SECS`,
+`L402_EXPIRY_SECS`, `REDEEM_ATTENTION_RETRY_SECS`,
+`CIRCUIT_BREAKER_PAUSE_SECS`) is a positive, finite number of seconds;
+`inf` is refused at startup like any other malformed value.
+
 With `CALENDAR_URL` the payment settings (`PHOENIXD_URL`, `PHOENIX_CONF`,
 `MAX_PRICE_SATS`, `L402_EXPIRY_SECS`, the breaker, the redeem ceilings,
 `GATEWAY_UPGRADE_TOKEN`) are parsed and never used: `phoenix.conf` is not
@@ -180,28 +190,37 @@ check passes.
 
 Every `POLL_SECS` the buyer takes the debts oldest first, each to its
 next durable state. With `GATEWAY_URL` the submission is `POST
-/timestamp`: a 200 with a proof is the gateway's free door, and the proof
-is written atomically, the debt cleared, `proof_free`; a 402 enters the
-paid machinery (budget preflight, decode, ceilings, reserve, sidecar, pay,
+/timestamp`: a 200 that carries a proof is stored without a charge
+(written atomically, the debt cleared, logged `proof_free`; the
+gateway's free door, which answered so, was retired on 2026-09-18, and
+the path remains for the calendar's answer); a 402 enters the paid
+machinery (budget preflight, decode, ceilings, reserve, sidecar, pay,
 redeem, breaker). A fingerprint whose proof already exists has its debt
-cleared without another submission (`already_bought`).
+cleared without another submission (`already_bought`), once the proof
+and its directory have been fsynced again: the proof's presence says it
+was written, not that the write's barrier held, and a pass whose
+directory fsync failed leaves exactly this state (`proof_sync_failed`
+and the debt kept while the barrier keeps failing).
 
 With `CALENDAR_URL` the submission is the 32 raw digest bytes to the
 calendar's counted `POST /digest`, never the operator lane
 `/operator/digest`, so every record this adapter submits is counted in the
 calendar's receipts. The calendar answers the serialized pending timestamp;
 the adapter prefixes the detached-file header (magic, version, the sha256
-op, the digest) and stores the result exactly as a free-door answer, with
-the same whole-proof check, pending marker, atomic write and
+op, the digest) and stores the result exactly as any 200 that carries a
+proof, with the same whole-proof check, pending marker, atomic write and
 `clear_debt`. The bytes are what the `ots` client writes for a single
 calendar; the parser that builds and later upgrades them is a copy of the
 one in the fork's `ops/selfstamp.py`, and both are held to one corpus of
 proof bytes (`proof_corpus.py`, the same file in both trees) against the
 opentimestamps library as the oracle: every byte consumed, every
 attestation payload consumed to its end, the library's size limits at
-their boundaries, and two stated narrowings (only `sha256`, `append` and
-`prepend`; a varuint of at most ten bytes). `docs/contracts.md`, "The
-proof parser", is the contract. Answers that are not the
+their boundaries, two stated narrowings (only `sha256`, `append` and
+`prepend`; a varuint of at most ten bytes), and the four attestation
+tags the library knows read as it reads them (pending, and the Bitcoin,
+Litecoin and Ethereum block-header tags; only Bitcoin counts, the other
+two read as unknown). `docs/contracts.md`, "The proof parser", is the
+contract. Answers that are not the
 protocol are refused and the debt stays: a 402 (the URL points at a
 gateway) is `challenge_failed … note=calendar_answered_402` and touches no
 payment machinery; a 200 that is not a pending timestamp of this digest is
@@ -217,8 +236,8 @@ first, each to completion. With `INFLIGHT=n` a pass may hold up to n
 submissions in the air at once, and only submissions: the worker threads
 do nothing but the HTTP call, and every answer is handled on the buyer
 thread, so proof writes, `clear_debt`, the ledger, the log and the breaker
-are touched by one thread exactly as at 1. A free-door answer completes as
-at 1. The first sign of the paid door, a 402 or a sidecar already on disk,
+are touched by one thread exactly as at 1. A 200 that carries a proof
+completes as at 1. The first sign of the paid door, a 402 or a sidecar already on disk,
 ends the concurrent phase: the answers already in flight are collected,
 then that debt and every remaining debt go one at a time through the same
 paid machinery (budget preflight, decode, ceilings, reserve, sidecar, pay,
@@ -293,7 +312,13 @@ a Bitcoin block, and they are a proof of the same digest
 the marker is cleared after those bytes are on disk and
 `bitcoin_attestation_present` is logged. A proof the adapter cannot walk
 (a fork marker, which a proof from one calendar never has) is logged
-`upgrade_needs_attention status=nonlinear` with its marker kept.
+`upgrade_needs_attention status=nonlinear` with its marker kept. A proof
+found already anchored with its marker still standing (a pass that died,
+or whose directory fsync failed, between the write and the marker) is
+fsynced with its directory again before the marker goes
+(`upgrade_sync_failed`, marker kept, while that fails). A pending index
+that cannot be listed is an error, logged `upgrader_error` and asked
+again next pass, never a pass that found nothing to do.
 
 ### Switching configurations
 
@@ -375,11 +400,13 @@ cut relies on.
 
 ## Tests
 
-The suite, 51 tests, needs no network, no phoenixd and no calendar; both
-are faked in-process:
+The suite, 99 tests in three files, needs no network, no phoenixd and
+no calendar (both are faked in-process), and needs the `opentimestamps`
+package, the parser corpus's oracle: without it the corpus tests fail
+rather than skip.
 
 ```bash
-python3 -m unittest test_api_endpoint -v
+python3 -m unittest discover -v
 ```
 
 What it pins, by test name. The door contract, including the 411, 400 and
@@ -441,7 +468,15 @@ marker and every attestation payload not consumed whole refused as
 `INVALID`, and `inspect_proof` never raising over thousands of mutated
 and random inputs; the smoke script naming only functions that exist;
 the startup reconciliation, on the objects and with the
-real service; and the quiet server on a client disconnect.
+real service; and the quiet server on a client disconnect. The
+2026-09-18 cold review's findings are there too: a file found on disk
+fsynced again, with its directory, before intake acknowledges it, the
+buyer clears the debt behind it or the upgrader clears the marker behind
+it, the barrier failing on the write and again on the retry and then
+holding (`TestResumedBarriers`); a pending index that cannot be listed
+raised, logged by the upgrader's loop every pass and refused at the start,
+never read as empty (`TestPendingIndexListing`); every interval a
+positive, finite number (`TestIntervalConfig`).
 
 `CALENDAR_URL`, against a fake calendar speaking the fork's protocol:
 exactly one of the two URLs, and the calendar-mode defaults
@@ -462,14 +497,16 @@ a non-linear proof keeps its marker
 (`test_calendar_mode_nonlinear_proof_needs_attention_keeps_marker`);
 `INFLIGHT=8` overlaps and never holds one fingerprint twice
 (`test_calendar_mode_inflight_eight_hits_digest_once_per_fingerprint`); the
-proof bytes round-trip through the opentimestamps library where it is
-importable (`test_ots_parser_cross_checks_with_the_library`).
+proof bytes round-trip through the opentimestamps library
+(`test_ots_parser_cross_checks_with_the_library`).
 
 `test_proof_corpus.py` runs the corpus in `proof_corpus.py` against
-both readers and, where the library is importable, against the library:
-what parses for one parses for the other, with the two narrowings named;
+both readers and against the library, which the suite requires: what
+parses for one parses for the other, with the two narrowings named;
 every strict prefix and one-byte extension of every valid proof is
-invalid for both. The integration tests wait for the log line a
+invalid for both; each of the four attestation tags the library knows
+is read as it reads it, a valid, an empty, a trailing and an
+unterminated payload each, alone and beside a Bitcoin node. The integration tests wait for the log line a
 transition ends with (`bought`, `proof_free`, `already_bought`,
 `bitcoin_attestation_present`), never for a file that appears midway
 (2026-09-15/16 review F22: assertions raced the proof's rename).

@@ -4,7 +4,9 @@ What the adapter promises, who owns unfinished work at each handoff, what
 durable evidence lets it forget, and which records are authoritative.
 Every statement is made by code in `api_endpoint.py` and pinned by a test
 named here; a change to any of them changes this file first
-(CONTRIBUTING.md). Written 2026-09-16 against the 2026-09-15/16 reviews.
+(CONTRIBUTING.md). Written 2026-09-16 against the 2026-09-15/16 reviews;
+corrected 2026-09-18 for the cold review's R02, R09, R16 and R19, each
+named where it changed a table.
 
 The words:
 
@@ -24,8 +26,8 @@ The words:
 
 | Request | Success | The promise | What it does not promise |
 |---|---|---|---|
-| `POST /record` | `200 received <fp>` | The debt file for `<fp>` is on disk, its bytes and its directory fsynced, before the reply is written, under the fingerprint's lock; or a whole proof of `<fp>` already exists. From here the adapter owns the obligation until `proofs/<fp>.ots` holds a whole proof of `<fp>`. | Not when the proof will exist; not that the calendar or gateway has been told yet; nothing about the bytes but their hash. |
-| `POST /record` | `500 cannot record the debt; not received` | Acceptance was not confirmed: the debt could not be written or synced, and the adapter tried to remove it. The client must retry, and can do so safely. | Not that nothing exists: the removal can fail too (logged `debt_cleanup_failed`), and a debt file may remain. Such a debt is met by the buyer like any other, and the retry is answered `received` as already owed. Work may already exist; it is never duplicated. |
+| `POST /record` | `200 received <fp>` | The debt file for `<fp>` is on disk, its bytes and its directory fsynced, before the reply is written, under the fingerprint's lock; or a whole proof of `<fp>` already exists. A debt found already on file is fsynced again, with its directory, before the reply: its presence is visibility, the barrier is the acknowledgement (2026-09-18 cold review R02). From here the adapter owns the obligation until `proofs/<fp>.ots` holds a whole proof of `<fp>`. | Not when the proof will exist; not that the calendar or gateway has been told yet; nothing about the bytes but their hash. |
+| `POST /record` | `500 cannot record the debt; not received` | Acceptance was not confirmed: the debt could not be written or synced, and the adapter tried to remove it. The client must retry, and can do so safely. | Not that nothing exists: the removal can fail too (logged `debt_cleanup_failed`), and a debt file may remain. Such a debt is met by the buyer like any other; the retry repeats its barrier and is answered `received` as already owed only when that holds, else 500 again (R02: the retry used to acknowledge the file by its presence). Work may already exist; it is never duplicated. |
 | `POST /record` | 400 / 404 / 405 / 411 | Refused before any write. | — |
 
 **Ambiguous outcomes.** A client that times out after the debt's directory
@@ -56,8 +58,8 @@ proof.
 | client → door | bytes in flight | fingerprint computed | nobody durable | none needed: no reply yet |
 | door → debt | fingerprint | `debts/<fp>` fsynced with its directory | the debt | the directory fsync returning; only then `received` |
 | debt → buyer | debt | submitted to the calendar (`POST /digest`) or the gateway | the debt, still: a submission whose answer is lost is submitted again next pass; the calendar dedupes inside its horizon | never before `store_proof` |
-| answer → proof | proof bytes in memory | `pending/<fp>` fsynced, `proofs/<fp>.ots` written atomically, `debts/<fp>` unlinked, in that order under the lock | the proof file | the debt's unlink: from here `proof_on_disk` is the fact and the debt would only be recreated by the reconciliation if the proof turned out not to parse |
-| pending proof → upgrader | marker | `GET /timestamp/<commitment>` answered 200 | the marker | the anchored bytes written atomically over the proof, then the marker cleared |
+| answer → proof | proof bytes in memory | `pending/<fp>` fsynced, `proofs/<fp>.ots` written atomically and its directory fsynced, `debts/<fp>` unlinked, in that order under the lock | the debt until the proof's directory fsync returns; then the proof file | the directory fsync after the rename, then the debt's unlink: a proof visible after its rename is not known durable until that fsync returns, so a pass that finds a proof beside a debt repeats the barrier before the debt goes (A2). From the unlink `proof_on_disk` is the fact, and the debt would only be recreated by the reconciliation if the proof turned out not to parse |
+| pending proof → upgrader | marker | `GET /timestamp/<commitment>` answered 200 | the marker | the anchored bytes written atomically over the proof and their directory fsynced, then the marker cleared; a pass that finds the anchored proof with its marker standing repeats the fsync before it clears (A3) |
 | adapter → operator | files under `DATA_DIR` | the operator copies proofs out | the operator | outside this contract |
 
 ## 4. Workflow 1: acceptance → durable debt → pending proof and upgrade tracking → anchored proof
@@ -70,9 +72,9 @@ proof.
 | Preconditions | `Content-Length` present; body non-empty (or `X-Digest: sha256` with 64 hex chars); the fingerprint's lock taken |
 | Side effects | the debt file (`O_EXCL`, fsync, directory fsync); one `received` log line |
 | Acknowledgement point | the reply, after `write_debt` returns |
-| Ambiguous outcomes | reply lost after the fsync (the promise stands; the retry is a no-op); crash between `O_EXCL` create and the fsync (an empty or torn debt file may exist: its content is unused, its name is the fact; the next start's reconciliation and the buyer treat it as owed, which is the safe direction); a 500 whose cleanup also failed (a debt file remains, logged `debt_cleanup_failed`; owed like any other; the client's retry is answered as owed) |
+| Ambiguous outcomes | reply lost after the fsync (the promise stands; the retry is a no-op); crash between `O_EXCL` create and the fsync (an empty or torn debt file may exist: its content is unused, its name is the fact; the next start's reconciliation and the buyer treat it as owed, which is the safe direction); a 500 whose cleanup also failed (a debt file remains, logged `debt_cleanup_failed`; owed like any other; the client's retry fsyncs it with its directory under the lock and is answered as owed only when that barrier holds, else 500 again: 2026-09-18 cold review R02, the retry used to acknowledge the file by its presence alone) |
 | Recovery | none needed |
-| Tests | `test_review_fixes.TestIntake`, `test_api_endpoint` door tests |
+| Tests | `test_review_fixes.TestIntake`, `TestIntakeCleanup`, `TestResumedBarriers` (the barrier failing on the write and again on the retry, each injection counted, then holding), `test_api_endpoint` door tests |
 
 ### A2. The buyer: debt → pending proof (calendar mode)
 
@@ -81,10 +83,10 @@ proof.
 | Authoritative state | the debt until `store_proof` completes; then the proof |
 | Preconditions | a whole proof of `<fp>` is not already on disk (`proof_on_disk`); the calendar answers 200 with a pending timestamp of exactly this digest |
 | Side effects, in order under the lock | (1) `pending/<fp>` created and its directory fsynced; (2) `proofs/<fp>.ots` written to a temporary name, fsynced, renamed, directory fsynced; (3) the sidecar (if any) and the debt unlinked |
-| Acknowledgement point | (3): the debt is gone |
-| Ambiguous outcomes | a stop after (1): marker without proof, debt present (kept: a debt exists); after (2): proof and debt both present (`already_bought` clears the debt next pass, no second submission); a calendar answer that is not the protocol (402, a non-pending timestamp, garbage): the debt stays, logged, asked again next pass; 503 or unreachable: the pass ends, every debt stays |
+| Acknowledgement point | (2)'s directory fsync, then (3): the debt goes only after the proof's barrier returned. The rename in (2) is visibility, not acknowledgement |
+| Ambiguous outcomes | a stop after (1): marker without proof, debt present (kept: a debt exists); a stop after (2), or (2)'s directory fsync failing after the rename (`store_proof` raises, the debt stays): proof and debt both present, the proof visible and its durability unknown; `already_bought` fsyncs the proof and its directory again, under the lock, and clears the debt only when that returns, else logs `proof_sync_failed` and keeps the debt for the next pass; no second submission either way (2026-09-18 cold review R02: the debt used to go on the proof's presence); a calendar answer that is not the protocol (402, a non-pending timestamp, garbage): the debt stays, logged, asked again next pass; 503 or unreachable: the pass ends, every debt stays |
 | Recovery | the next pass, or the next start's reconciliation |
-| Tests | `test_api_endpoint.TestCalendarMode`, `test_review_fixes.TestCompletion`, `test_sigkill_mid_burst_every_acked_record_bought`, `test_inflight_sigkill_mid_flight_converges_one_proof_each` |
+| Tests | `test_api_endpoint.TestCalendarMode`, `test_review_fixes.TestCompletion`, `TestResumedBarriers`, `test_sigkill_mid_burst_every_acked_record_bought`, `test_inflight_sigkill_mid_flight_converges_one_proof_each` |
 
 ### A3. The upgrader: pending → bitcoin_attestation_present
 
@@ -92,11 +94,11 @@ proof.
 |---|---|
 | Authoritative state | the proof file; the marker is the index |
 | Preconditions | the marker exists; the proof parses as pending and linear; the calendar answers 200 for the commitment |
-| Side effects | the spliced bytes, deserialised whole and checked to be a proof of `<fp>` with a Bitcoin attestation node, written atomically over the proof under the lock; then the marker cleared; `bitcoin_attestation_present` logged |
-| Acknowledgement point | the atomic write's rename |
-| Ambiguous outcomes | a stop after the write and before the marker clear: the next pass reads the proof, sees the attestation, clears the marker; a 404: pending, nothing written; an answer that does not splice: `upgrade_needs_attention`, marker kept; a fork-marked proof (never from one calendar): `nonlinear`, marker kept |
-| Recovery | the next pass; the next start's reconciliation clears a marker on a finished proof |
-| Tests | `test_calendar_mode_upgrade_404_stays_pending_then_anchored_bytes_spliced`, `test_upgrade_replaces_only_on_anchored_and_then_stops`, `test_review_fixes.TestCompletion` |
+| Side effects | the spliced bytes, deserialised whole and checked to be a proof of `<fp>` with a Bitcoin attestation node, written atomically over the proof and their directory fsynced, under the lock; then the marker cleared; `bitcoin_attestation_present` logged |
+| Acknowledgement point | the directory fsync after the atomic write's rename: the rename is visibility (2026-09-18 cold review R02; this row used to name the rename) |
+| Ambiguous outcomes | a stop after the write and before the marker clear, or a directory fsync that failed after the rename (`upgrade_failed status=write_failed`, the marker kept): the next pass reads the proof, sees the attestation, fsyncs the file and its directory again under the lock and clears the marker only when that returns, else logs `upgrade_sync_failed` and keeps the marker (R02: the marker used to go on the attestation's presence); a 404: pending, nothing written; an answer that does not splice: `upgrade_needs_attention`, marker kept; a fork-marked proof (never from one calendar): `nonlinear`, marker kept |
+| Recovery | the next pass; the next start's reconciliation clears a marker on a finished proof, and its final directory fsyncs are that pass's barrier |
+| Tests | `test_calendar_mode_upgrade_404_stays_pending_then_anchored_bytes_spliced`, `test_upgrade_replaces_only_on_anchored_and_then_stops`, `test_review_fixes.TestCompletion`, `TestResumedBarriers` |
 
 ### A4. Start: the reconciliation
 
@@ -106,7 +108,7 @@ proof.
 | Preconditions | before the door, the buyer and the upgrader start |
 | Side effects, per proof | parses whole with a Bitcoin attestation: a stale marker is cleared; pending: a missing marker is restored; anything else: **the debt is written and fsynced first, then the bytes are moved aside** as `<fp>.ots.invalid-<time>`, then the marker cleared (2026-09-15 review F01). Per aside file with neither proof nor debt: the debt is recreated (`aside_requeued`). Per marker with neither proof, debt nor sidecar: dropped. |
 | Acknowledgement point | `reconciled` in the log, then `startup` |
-| Ambiguous outcomes | a stop after the debt write and before the move: the invalid proof is found again next start and moved beside the existing debt; a failed debt write: the start fails (exit 2) with the proof still in place, so the next start repeats the repair; a parser exception on any bytes: the bytes are INVALID, never a crash (2026-09-15 review F13) |
+| Ambiguous outcomes | a stop after the debt write and before the move: the invalid proof is found again next start and moved beside the existing debt; a failed debt write: the start fails (exit 2) with the proof still in place, so the next start repeats the repair; a pending index that cannot be listed: the start fails (exit 2, `cannot reconcile DATA_DIR`) rather than treating the index as empty (2026-09-18 cold review R16); a parser exception on any bytes: the bytes are INVALID, never a crash (2026-09-15 review F13) |
 | Recovery | re-run: every step is idempotent |
 | Tests | `test_review_fixes.TestReconciliation`, `TestReconciliationAtStartup` |
 
@@ -123,7 +125,7 @@ Findings F04, F15, F16 of the 2026-09-15/16 review are theirs.
 | Invariant | Where it holds | Where it is checked |
 |---|---|---|
 | Conservation of obligations | every `received` has a debt or a whole proof; the debt goes only after the proof is on disk; an invalid proof found at start recreates the debt before it is moved; an aside file alone recreates it | A1, A2, A4 tests |
-| Ambiguity is a state | bytes that do not parse are INVALID, not a crash and not a proof; a calendar answer that is not the protocol keeps the debt; a lost answer is asked again; a corrupt ledger pauses, never resets | A2, A4; `test_corrupt_ledger_pauses_purchases_never_intake` |
+| Ambiguity is a state | bytes that do not parse are INVALID, not a crash and not a proof; a calendar answer that is not the protocol keeps the debt; a lost answer is asked again; a corrupt ledger pauses, never resets; a pending index that cannot be listed is an error the upgrader logs every pass (`upgrader_error`) and asks again, and the start refuses, never an empty index (R16); a file found on disk is visible, not known durable, until its barrier is repeated (R02) | A2, A4; `test_corrupt_ledger_pauses_purchases_never_intake`; `test_review_fixes.TestPendingIndexListing`, `TestResumedBarriers` |
 | Recovery is interruptible | every reconciliation step leaves a state the next start repairs the same way | A4 tests |
 | Concurrency preserves decisions | one fingerprint is in flight at most once; the marker, proof and debt change hands under the fingerprint's lock; the upgrader never drops a marker while a debt exists or a buyer holds the lock | `TestInflight`, `TestCompletion` |
 | Safety includes progress | a 503, a rate limit or an unreachable door ends the pass and keeps every debt; the next pass tries again; one bad proof (set aside) never blocks the others | A2, A4 |
@@ -147,28 +149,47 @@ adds (2); nothing here makes (3).
    followed by an operation or an attestation, never another fork; at
    most 255 operations on any path. Two narrowings, stated: only
    `sha256`, `append` and `prepend` are accepted (the public client knows
-   more), and a varuint longer than ten bytes is refused.
+   more), and a varuint longer than ten bytes is refused. The attestation
+   tags the client knows are four, and each payload is read as the
+   client reads it: pending (a URI), and the block-header attestations of
+   Bitcoin, Litecoin and Ethereum (one varuint height, read to the
+   payload's end); any other tag is unknown and its payload opaque, up to
+   8192 bytes. That is the supported subset, stated: parity with the
+   client on what parses, and Bitcoin alone on what counts (2026-09-18
+   cold review R09: the Litecoin and Ethereum tags used to be read as
+   opaque unknowns, so an empty or trailing payload the client refuses
+   parsed, and beside a Bitcoin node made a proof
+   `bitcoin_attestation_present`). `parse_ots` is linear only, by
+   design.
 2. **Contains a Bitcoin attestation** (`bitcoin_attestation_present`):
    after (1), an attestation node carries the Bitcoin tag. A fact about
-   the file.
+   the file. A Litecoin or Ethereum attestation is not one: it reads as
+   unknown, no usable attestation, and no claim about that chain is made.
 3. **Verifies against Bitcoin**: never claimed here.
 
 `inspect_proof` never raises: any bytes give `INVALID` with a reason, or
 one of the two states. The corpus that pins (1) and (2) against the
 library is `proof_corpus.py` with `test_proof_corpus.py`; it is the same
 corpus the calendar fork carries for its readers, and a change to one is
-a change to both until the readers are one implementation.
+a change to both until the readers are one implementation. The library
+is the oracle and the suite needs it: without the `opentimestamps`
+package the corpus tests fail, they do not skip.
 
 ## 7. Configuration and locking
 
 One configuration function, `resolve_config`: invocation environment,
 then `.env` beside the script, then defaults; an empty string is unset;
 every malformed or missing setting is a startup error naming what to
-set. No setting is read anywhere else.
+set. Every interval (`POLL_SECS`, `UPGRADE_SECS`, `HEARTBEAT_SECS`,
+`L402_EXPIRY_SECS`, `REDEEM_ATTENTION_RETRY_SECS`,
+`CIRCUIT_BREAKER_PAUSE_SECS`) is a positive, finite number of seconds
+(2026-09-18 cold review R19: `inf` used to pass the check and stop the
+buyer at its first `time.sleep`, outside its catch). No setting is read
+anywhere else.
 
 | Tool | Used for | Where |
 |---|---|---|
-| per-fingerprint lock (in-process) | the three files of one fingerprint change hands atomically with respect to the other threads; a duplicate `POST` waits for the original's durability | `write_debt`, `store_proof`, `_apply_upgrade`, `_drop_stale_marker` |
+| per-fingerprint lock (in-process) | the three files of one fingerprint change hands atomically with respect to the other threads; a duplicate `POST` waits for the original's durability; a barrier repeated over a file found on disk (`fsync_existing`) is taken under it too | `write_debt` (the duplicate's fsync of the existing debt), `store_proof`, `buy_one` (`already_bought`'s fsync and the debt's clearing), `_apply_upgrade`, `upgrade_pass` (the marker cleared behind an anchored proof), `_drop_stale_marker` |
 | whole-run lock | not used: one process owns `DATA_DIR`. Two adapters on one `DATA_DIR` are not excluded by code; the deployment runs one unit per `DATA_DIR`. Stated as a limit. | — |
 | atomic file replace | every file that is rewritten (`proofs/<fp>.ots`, `ledger`, `.l402`, `heartbeat`): unique temporary name in the same directory, fsync, rename, directory fsync | `atomic_write` |
 

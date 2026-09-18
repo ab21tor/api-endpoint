@@ -24,6 +24,12 @@ is a change to both until the readers are one implementation.
 MAGIC = b"\x00OpenTimestamps\x00\x00Proof\x00\xbf\x89\xe2\xe8\x84\xe8\x92\x94"
 PENDING_TAG = bytes.fromhex("83dfe30d2ef90c8e")
 BITCOIN_TAG = bytes.fromhex("0588960d73d71901")
+# The two other block-header attestations the public client knows and
+# reads as one varuint height: no usable attestation for the readers here,
+# which report them as unknown, but a payload the client refuses is
+# refused by them too (2026-09-18 cold review R09).
+LITECOIN_TAG = bytes.fromhex("06869a0d73d71b45")
+ETHEREUM_TAG = bytes.fromhex("30fe8087b5c7ead7")
 DIGEST = bytes(range(32))
 URI = b"http://127.0.0.1:14788/"
 
@@ -109,6 +115,10 @@ def cases():
         "parses", "forked", [("bitcoin", 1000 + i) for i in range(1000)] + [("bitcoin", 2)])
     add("unknown_attestation", head() + att(UNKNOWN_TAG, b"\x05\x06"), "parses", "linear",
         [("unknown", UNKNOWN_TAG.hex())])
+    for name, tag in (("litecoin", LITECOIN_TAG), ("ethereum", ETHEREUM_TAG)):
+        add(name + "_height", head() + att(tag, vu(850000)), "parses", "linear", [("unknown", tag.hex())])
+        add(name + "_beside_bitcoin", head() + b"\xff" + att(tag, vu(1)) + append(b"\x44") + sha() + bitcoin(850000),
+            "parses", "forked", [("unknown", tag.hex()), ("bitcoin", 850000)])
     add("unknown_attestation_payload_8192", head() + att(UNKNOWN_TAG, b"x" * 8192), "parses", "linear",
         [("unknown", UNKNOWN_TAG.hex())])
     add("uri_empty", head() + pending(b""), "parses", "linear", [("pending", "")])
@@ -119,11 +129,22 @@ def cases():
         "linear", [("bitcoin", 1)])
     add("ops_255_on_one_path", head() + sha() * 255 + bitcoin(1), "parses", "linear", [("bitcoin", 1)])
 
-    # Full consumption.
+    # Full consumption: every known payload read to its end, for each of
+    # the four tags the client knows, alone and beside a Bitcoin node.
     add("bitcoin_payload_trailing_byte", head() + att(BITCOIN_TAG, vu(850000) + b"\x00"), "invalid")
     add("bitcoin_payload_empty", head() + att(BITCOIN_TAG, b""), "invalid")
+    add("bitcoin_payload_unterminated_varuint", head() + att(BITCOIN_TAG, b"\x80"), "invalid")
     add("pending_payload_trailing_byte", head() + att(PENDING_TAG, vb(URI) + b"\x00"), "invalid")
+    add("pending_payload_empty", head() + att(PENDING_TAG, b""), "invalid")
     add("pending_uri_longer_than_payload", head() + att(PENDING_TAG, vu(50) + b"abc"), "invalid")
+    for name, tag in (("litecoin", LITECOIN_TAG), ("ethereum", ETHEREUM_TAG)):
+        add(name + "_payload_empty", head() + att(tag, b""), "invalid")
+        add(name + "_payload_trailing_byte", head() + att(tag, vu(1) + b"\x00"), "invalid")
+        add(name + "_payload_unterminated_varuint", head() + att(tag, b"\x80"), "invalid")
+        add(name + "_payload_empty_beside_bitcoin",
+            head() + b"\xff" + att(tag, b"") + append(b"\x44") + sha() + bitcoin(850000), "invalid")
+        add(name + "_payload_trailing_byte_beside_bitcoin",
+            head() + b"\xff" + att(tag, vu(1) + b"\x00") + append(b"\x44") + sha() + bitcoin(850000), "invalid")
     add("attestation_payload_8193", head() + att(UNKNOWN_TAG, b"x" * 8193), "invalid")
 
     # Limits at their boundaries.

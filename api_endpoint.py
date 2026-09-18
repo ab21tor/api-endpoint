@@ -23,6 +23,7 @@ import http.client
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
 from concurrent.futures import wait as wait_futures
 import json
+import math
 import os
 import re
 import sys
@@ -53,6 +54,14 @@ HEX64_ANYCASE = re.compile(r"[0-9a-fA-F]{64}")
 OTS_MAGIC = b"\x00OpenTimestamps\x00\x00Proof\x00\xbf\x89\xe2\xe8\x84\xe8\x92\x94"
 BITCOIN_TAG = bytes.fromhex("0588960d73d71901")
 BITCOIN_ATTESTATION = b"\x00" + BITCOIN_TAG
+# The other two block-header attestations the public client knows
+# (LitecoinBlockHeaderAttestation; EthereumBlockHeaderAttestation under
+# dubious/). Their payload is one varuint height, read to its end exactly
+# as the client reads it; they are not usable attestations here and read
+# as unknown (2026-09-18 cold review R09: they used to be opaque, so an
+# empty or trailing payload the client refuses parsed, and beside a
+# Bitcoin node made a proof bitcoin_attestation_present).
+HEIGHT_TAGS = (BITCOIN_TAG, bytes.fromhex("06869a0d73d71b45"), bytes.fromhex("30fe8087b5c7ead7"))
 
 # OpenTimestamps proof bytes, the subset a single calendar emits — a COPY of
 # the parser in the fork's ops/selfstamp.py (2026-09-11), kept here because
@@ -131,10 +140,12 @@ def read_varbytes(data, pos, max_len, min_len=0):
 
 def read_attestation(data, pos):
     """The attestation whose marker byte was just read: (kind, value, end).
-    A known payload is consumed to its last byte (2026-09-15/16 review F03:
-    a byte after the height, or no height at all, used to pass); a pending
-    URI is at most MAX_URI bytes of URI_CHARS; an unknown tag is kept as
-    ("unknown", tag hex), which parses and is no usable attestation."""
+    A known payload (pending, and the three block-header tags) is consumed
+    to its last byte (2026-09-15/16 review F03: a byte after the height, or
+    no height at all, used to pass); a pending URI is at most MAX_URI bytes
+    of URI_CHARS; only Bitcoin is a usable attestation; every other tag,
+    the Litecoin and Ethereum ones included, is kept as ("unknown", tag
+    hex), which parses and is no usable attestation."""
     atag = data[pos:pos + 8]
     if len(atag) != 8:
         raise OtsError("truncated attestation tag")
@@ -147,11 +158,12 @@ def read_attestation(data, pos):
         if any(b not in URI_CHARS for b in uri):
             raise OtsError("pending uri has a character outside the allowed set")
         return "pending", uri.decode("ascii"), pos
-    if atag == BITCOIN_TAG:
+    if atag in HEIGHT_TAGS:
         height, end = read_varuint(payload, 0)
         if end != len(payload):
-            raise OtsError("trailing bytes in the bitcoin attestation")
-        return "bitcoin", height, pos
+            raise OtsError("trailing bytes in the block header attestation")
+        if atag == BITCOIN_TAG:
+            return "bitcoin", height, pos
     return "unknown", atag.hex(), pos
 
 
@@ -457,8 +469,11 @@ def resolve_config(environ, script_dir=SCRIPT_DIR):
             v = float(raw)
         except (TypeError, ValueError):
             raise ConfigError(f"{key} must be a number of seconds, got {raw!r}")
-        if not v > 0:
-            raise ConfigError(f"{key} must be a positive number of seconds, got {raw!r}")
+        # Finite as well as positive: float() reads 'inf', and time.sleep
+        # refuses it later, outside the worker's catch (2026-09-18 cold
+        # review R19).
+        if not (math.isfinite(v) and v > 0):
+            raise ConfigError(f"{key} must be a positive, finite number of seconds, got {raw!r}")
         return v
 
     def pint(key, default):
@@ -564,6 +579,23 @@ def fsync_dir(path):
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def fsync_existing(path):
+    """fsync a file found on disk, then its directory. Existence is
+    visibility, not durability: the write that made the file may have
+    stopped, or failed, at its barrier, and this process cannot tell. A
+    pass that acts on a file it finds (acknowledges the debt, clears the
+    debt behind the proof, clears the marker behind the upgrade) repeats
+    the barrier first, under the fingerprint's lock, and does not act if
+    the barrier fails again (2026-09-18 cold review R02: the retry used to
+    take the file's presence for the barrier having held). Raises OSError."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    fsync_dir(os.path.dirname(path) or ".")
 
 
 def write_all(fd, data):
@@ -979,13 +1011,18 @@ def write_debt(cfg, fp):
     acknowledgement. A debt that cannot be made durable (a write, file
     fsync or directory fsync error) is removed if it can be and the error
     raised; the door answers 500: acceptance not confirmed, retry safely,
-    a debt may nonetheless remain. Must complete before 'received' goes
-    out — the debt is the promise."""
+    a debt may nonetheless remain. A debt found already on file is
+    fsynced again, with its directory, before it is answered as owed: the
+    file may be the remainder of a 500 whose barrier and whose cleanup
+    both failed, and a retry that acknowledged it by its presence promised
+    what nothing had made durable (2026-09-18 cold review R02). Must
+    complete before 'received' goes out — the debt is the promise."""
     path = debt_path(cfg, fp)
     with fp_lock(fp):
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError:
+            fsync_existing(path)
             return False
         try:
             try:
@@ -1104,11 +1141,13 @@ def pending_clear(cfg, fp):
 
 
 def list_pending(cfg):
-    try:
-        names = os.listdir(cfg["pending_dir"])
-    except OSError:
-        return []
-    return sorted(n for n in names if HEX64.fullmatch(n))
+    """The fingerprints in the pending index. Raises OSError when the
+    directory cannot be listed: work that cannot be seen is not no work
+    (2026-09-18 cold review R16: the error used to read as an empty index,
+    and the upgrader's pass ended as if nothing were pending). The
+    upgrader's loop logs the error and asks again next pass; the start
+    fails on it."""
+    return sorted(n for n in os.listdir(cfg["pending_dir"]) if HEX64.fullmatch(n))
 
 
 PENDING_BUILT = ".built"
@@ -1571,8 +1610,18 @@ def buy_one(cfg, password, fp, flags):
     if proof_on_disk(cfg, fp):
         # One record, one payment, one proof: a re-POSTed or already-bought
         # fingerprint costs nothing. Only a whole proof of this fingerprint
-        # counts; INVALID bytes are the reconciliation's to set aside.
-        clear_debt(cfg, fp)
+        # counts; INVALID bytes are the reconciliation's to set aside. The
+        # proof is on disk, not known to be durable: the pass that wrote it
+        # may have failed at its directory fsync and left the debt for this
+        # reason. The barrier is repeated before the debt goes; if it fails
+        # again the debt stays and the next pass asks again.
+        with fp_lock(fp):
+            try:
+                fsync_existing(proof_path(cfg, fp))
+            except OSError as exc:
+                log_event(cfg, "proof_sync_failed", fp=fp, err=type(exc).__name__)
+                return True
+            clear_debt(cfg, fp)
         log_event(cfg, "already_bought", fp=fp)
         return True
 
@@ -1900,7 +1949,17 @@ def upgrade_pass(cfg, flags):
                 except OSError:
                     continue
                 if bitcoin_attestation_present(data):
-                    pending_clear(cfg, fp)  # finished by an earlier pass
+                    # Finished by an earlier pass, whose write may have failed
+                    # at its directory fsync and left the marker for this
+                    # reason: the barrier is repeated before the marker goes,
+                    # and a marker behind a barrier that fails again stays.
+                    with fp_lock(fp):
+                        try:
+                            fsync_existing(path)
+                        except OSError as exc:
+                            log_event(cfg, "upgrade_sync_failed", fp=fp, err=type(exc).__name__)
+                            continue
+                        pending_clear(cfg, fp)
                     continue
                 checked += 1
                 outstanding[pool.submit(upgrade_proof, cfg, fp, data)] = (fp, path)

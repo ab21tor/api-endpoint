@@ -1837,8 +1837,6 @@ class TestInflight(IntegrationBase):
         self.assertEqual(order, fps[:3])
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 # LOG_CAP_BYTES: the data log rotates to log.1 once it reaches the cap
@@ -1969,12 +1967,11 @@ class TestOtsParser(unittest.TestCase):
         with self.assertRaises(api_endpoint.OtsError):
             api_endpoint.splice_upgrade(upgraded, cal_bitcoin_response(1))
 
-        try:
-            from opentimestamps.core.serialize import StreamDeserializationContext
-            from opentimestamps.core.timestamp import DetachedTimestampFile
-            from opentimestamps.core.notary import BitcoinBlockHeaderAttestation
-        except ImportError:
-            self.skipTest("opentimestamps library not importable here")
+        # The library is the oracle and the suite needs it: no skip
+        # (2026-09-18 cold review R09).
+        from opentimestamps.core.serialize import StreamDeserializationContext
+        from opentimestamps.core.timestamp import DetachedTimestampFile
+        from opentimestamps.core.notary import BitcoinBlockHeaderAttestation
         import io
         for raw in (ots, upgraded):
             detached = DetachedTimestampFile.deserialize(
@@ -2164,3 +2161,7 @@ class TestCalendarMode(CalendarBase):
         for fp in fps:
             with open(self.proof_file(fp), "rb") as f:
                 self.assertEqual(api_endpoint.proof_digest(f.read()), fp)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

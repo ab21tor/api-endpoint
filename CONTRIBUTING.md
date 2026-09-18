@@ -30,9 +30,9 @@ that appears midway.
 python3 -m unittest discover -v
 ```
 
-Standard library only for the adapter; the parser corpus compares the
-readers with the `opentimestamps` library where it is importable and
-says so when it is not.
+Standard library only for the adapter itself; the suite needs the
+`opentimestamps` package, the parser corpus's oracle, and fails without
+it rather than skipping.
 
 ## Commits
 

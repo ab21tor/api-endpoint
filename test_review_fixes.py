@@ -12,6 +12,7 @@ Each test here fails against da72b6b and passes now. Failure injection at
 the write boundary and a killed process are what these tests do; a power
 cut is not simulated.
 """
+import base64
 import contextlib
 import errno
 import io
@@ -419,8 +420,6 @@ class TestQuietServer(unittest.TestCase):
         self.assertNotIn("secret", log)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class TestOldSidecarReservation(UnitBase):
@@ -687,3 +686,223 @@ class TestIntakeCleanup(UnitBase):
         # The leftover is a debt like any other: the buyer meets it, and a
         # duplicate request is answered as already owed.
         self.assertFalse(a.write_debt(self.cfg, self.fp))
+
+
+class TestResumedBarriers(UnitBase):
+    """A1, A2, A3 (2026-09-18 cold review R02): a file found on disk is
+    visible, not known durable. The write that made it may have failed at
+    its directory fsync, and until this change the pass that found it took
+    its presence for the barrier having held: intake answered `received`
+    for a debt left by a 500 whose barrier and cleanup both failed, the
+    buyer cleared the debt behind a proof whose barrier failed, the
+    upgrader cleared the marker behind a replacement whose barrier failed.
+    Now each repeats the barrier (fsync_existing: the file, then its
+    directory) under the fingerprint's lock before it acts, and does not
+    act when the barrier fails again. Fault model: fsync_dir made to fail
+    for one directory on every call, each injection counted (it fires on
+    the write and again on the retry: the retry's barrier is the fix), a
+    failing unlink for intake's cleanup; then the fault removed and the
+    next pass shown to complete. Not a power cut."""
+
+    def broken_dir_sync(self, directory, syncs):
+        original = a.fsync_dir
+
+        def broken(path):
+            if path == directory:
+                syncs.append(path)
+                raise OSError(errno.EIO, "injected directory barrier failure")
+            return original(path)
+        return broken
+
+    def door(self):
+        server = a.DoorServer(("127.0.0.1", 0), a.make_handler(self.cfg), self.cfg)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return server
+
+    def post(self, server):
+        import http.client
+        c = http.client.HTTPConnection(*server.server_address, timeout=5)
+        try:
+            c.request("POST", "/record", body=self.fp.encode(), headers={"X-Digest": "sha256"})
+            r = c.getresponse()
+            return r.status, r.read()
+        finally:
+            c.close()
+
+    def anchored_answer(self):
+        return json.dumps({"status": "anchored", "bitcoin_anchored": True,
+                           "ots": base64.b64encode(anchored(self.fp)).decode()}).encode()
+
+    def test_intake_does_not_acknowledge_an_unsynced_debt_by_its_presence(self):
+        server = self.door()
+        target = a.debt_path(self.cfg, self.fp)
+        syncs = []
+        real_unlink = os.unlink
+
+        def broken_unlink(path, *args, **kw):
+            if str(path) == target:
+                raise OSError(errno.EIO, "injected cleanup failure")
+            return real_unlink(path, *args, **kw)
+        with patch.object(a, "fsync_dir", self.broken_dir_sync(self.cfg["debts_dir"], syncs)), \
+                patch.object(a.os, "unlink", broken_unlink):
+            first = self.post(server)
+            second = self.post(server)
+        self.assertEqual(first[0], 500)
+        self.assertTrue(Path(target).exists(), "the cleanup failed too: the file remains")
+        self.assertEqual(second[0], 500, "the retry repeats the barrier and cannot confirm acceptance either")
+        self.assertEqual(syncs, [self.cfg["debts_dir"]] * 2, "the injection fired on the write and on the retry")
+        self.assertEqual(self.log().count("intake_error"), 2)
+        self.assertNotIn("received fp=", self.log())
+        # The barrier holds again: the same debt is answered as owed, once it is durable.
+        third = self.post(server)
+        self.assertEqual(third[0], 200)
+        self.assertIn(b"received " + self.fp.encode(), third[1])
+        self.assertIn("received fp=%s new_debt=false" % self.fp, self.log())
+        self.assertTrue(Path(target).exists())
+
+    def test_the_buyer_repeats_the_proof_barrier_before_it_clears_the_debt(self):
+        a.write_debt(self.cfg, self.fp)
+        syncs = []
+        with patch.object(a, "fsync_dir", self.broken_dir_sync(self.cfg["proofs_dir"], syncs)):
+            with self.assertRaises(OSError):
+                a.store_proof(self.cfg, self.fp, pending(self.fp))
+            self.assertTrue(self.exists("proof"), "visible")
+            self.assertTrue(self.exists("debt"), "and still owed")
+            self.assertTrue(a.buy_one(self.cfg, None, self.fp, flags()), "the pass goes on to the next debt")
+            self.assertTrue(self.exists("debt"), "the debt stays behind a proof whose barrier failed again")
+        self.assertEqual(syncs, [self.cfg["proofs_dir"]] * 2, "the injection fired on the write and on the retry")
+        self.assertIn("proof_sync_failed fp=" + self.fp, self.log())
+        self.assertNotIn("already_bought", self.log())
+        # The barrier holds again: the debt goes, once.
+        self.assertTrue(a.buy_one(self.cfg, None, self.fp, flags()))
+        self.assertFalse(self.exists("debt"))
+        self.assertTrue(self.exists("proof"))
+        self.assertIn("already_bought fp=" + self.fp, self.log())
+
+    def test_the_upgrader_repeats_the_barrier_before_it_clears_the_marker(self):
+        a.write_debt(self.cfg, self.fp)
+        a.store_proof(self.cfg, self.fp, pending(self.fp))
+        syncs = []
+        with patch.object(a, "fsync_dir", self.broken_dir_sync(self.cfg["proofs_dir"], syncs)):
+            self.assertFalse(a._apply_upgrade(self.cfg, self.fp, a.proof_path(self.cfg, self.fp), self.anchored_answer()))
+            self.assertTrue(a.bitcoin_attestation_present(Path(a.proof_path(self.cfg, self.fp)).read_bytes()), "visible")
+            self.assertTrue(self.exists("marker"), "and still tracked")
+            a.upgrade_pass(self.cfg, {"upgrade_gateway": a.StateChange()})
+            self.assertTrue(self.exists("marker"), "tracking kept behind a replacement whose barrier failed again")
+        self.assertEqual(syncs, [self.cfg["proofs_dir"]] * 2, "the injection fired on the write and on the retry")
+        self.assertIn("upgrade_sync_failed fp=" + self.fp, self.log())
+        # The barrier holds again: the marker goes.
+        a.upgrade_pass(self.cfg, {"upgrade_gateway": a.StateChange()})
+        self.assertFalse(self.exists("marker"))
+        self.assertTrue(a.bitcoin_attestation_present(Path(a.proof_path(self.cfg, self.fp)).read_bytes()))
+
+    def test_the_healthy_controls(self):
+        server = self.door()
+        self.assertEqual(self.post(server)[0], 200)
+        self.assertEqual(self.post(server)[0], 200)
+        self.assertTrue(self.exists("debt"))
+        self.assertTrue(a.store_proof(self.cfg, self.fp, pending(self.fp)))
+        self.assertFalse(self.exists("debt"))
+        self.assertTrue(a._apply_upgrade(self.cfg, self.fp, a.proof_path(self.cfg, self.fp), self.anchored_answer()))
+        self.assertFalse(self.exists("marker"))
+
+
+class TestPendingIndexListing(UnitBase):
+    """R16 (2026-09-18 cold review): a pending index that cannot be listed
+    used to read as an empty index, so an upgrader whose directory had
+    become unreadable found nothing to do, reported nothing, and went on
+    writing its heartbeat. Now the listing's error is raised: the
+    upgrader's loop logs it (`upgrader_error`) and asks again next pass,
+    the start fails on it, and only a listing that succeeded and is empty
+    means no pending work. Fault model: os.listdir made to fail for the
+    pending directory."""
+
+    class Stop(BaseException):
+        """Ends the loop under test from its sleep; not an Exception, so the
+        loop's own catch does not take it for a failure to survive."""
+
+    def unlistable(self):
+        original = os.listdir
+
+        def broken(path):
+            if path == self.cfg["pending_dir"]:
+                raise PermissionError(errno.EACCES, "injected listing failure")
+            return original(path)
+        return patch.object(a.os, "listdir", broken)
+
+    def test_an_index_that_cannot_be_listed_is_an_error_not_an_empty_index(self):
+        a.pending_mark(self.cfg, self.fp)
+        with self.unlistable():
+            with self.assertRaises(OSError):
+                a.list_pending(self.cfg)
+        self.assertEqual(a.list_pending(self.cfg), [self.fp], "readable again: the work is there")
+
+    def test_the_upgrader_pass_raises_and_touches_no_marker(self):
+        a.write_debt(self.cfg, self.fp)
+        a.store_proof(self.cfg, self.fp, pending(self.fp))
+        with self.unlistable():
+            with self.assertRaises(OSError):
+                a.upgrade_pass(self.cfg, {"upgrade_gateway": a.StateChange()})
+        self.assertTrue(self.exists("marker"))
+        self.assertNotIn("upgrade_pass", self.log(), "no pass was reported as done")
+
+    def test_the_upgrader_loop_reports_each_failed_pass_and_asks_again(self):
+        a.pending_mark(self.cfg, self.fp)
+        sleeps = []
+
+        def sleep(secs):
+            sleeps.append(secs)
+            if len(sleeps) == 2:
+                raise self.Stop()
+        hb = {}
+        with self.unlistable(), patch.object(a.time, "sleep", sleep):
+            with self.assertRaises(self.Stop):
+                a.upgrader_loop(self.cfg, hb)
+        self.assertEqual(sleeps, [self.cfg["upgrade_secs"]] * 2, "two passes, each followed by the wait")
+        self.assertEqual(self.log().count("upgrader_error"), 2, "each pass reports the index it could not read")
+        self.assertIn("upgrader_error err=PermissionError", self.log())
+        self.assertIn("upgrader", hb, "the heartbeat says the loop is alive, not that the work is done")
+
+    def test_the_start_fails_on_an_index_it_cannot_list(self):
+        with self.unlistable():
+            with self.assertRaises(OSError):
+                a.reconcile_state(self.cfg)
+
+    def test_a_listing_that_succeeded_and_is_empty_is_no_pending_work(self):
+        self.assertEqual(a.list_pending(self.cfg), [])
+        a.upgrade_pass(self.cfg, {"upgrade_gateway": a.StateChange()})
+        self.assertNotIn("upgrader_error", self.log())
+
+
+class TestIntervalConfig(unittest.TestCase):
+    """R19 (2026-09-18 cold review): float() reads 'inf', and a positive
+    check let it through, so POLL_SECS=inf started a buyer whose
+    time.sleep raised OverflowError outside its catch. Every interval is
+    now a positive, finite number of seconds or a startup error naming
+    the setting."""
+
+    INTERVALS = ("POLL_SECS", "UPGRADE_SECS", "HEARTBEAT_SECS", "L402_EXPIRY_SECS",
+                 "REDEEM_ATTENTION_RETRY_SECS", "CIRCUIT_BREAKER_PAUSE_SECS")
+
+    def resolve(self, **env):
+        with tempfile.TemporaryDirectory() as d:
+            return a.resolve_config({"LISTEN_ADDR": "127.0.0.1:8402", "CALENDAR_URL": "http://unused", **env}, script_dir=d)
+
+    def test_a_nonfinite_or_nonpositive_interval_is_refused_at_configuration(self):
+        for key in self.INTERVALS:
+            for bad in ("inf", "-inf", "nan", "Infinity", "0", "-1", "abc"):
+                with self.subTest(key=key, value=bad):
+                    with self.assertRaises(a.ConfigError) as caught:
+                        self.resolve(**{key: bad})
+                    self.assertIn(key, str(caught.exception))
+
+    def test_a_finite_interval_is_read(self):
+        cfg = self.resolve(POLL_SECS="2.5", UPGRADE_SECS="30")
+        self.assertEqual(cfg["poll_secs"], 2.5)
+        self.assertEqual(cfg["upgrade_secs"], 30.0)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
