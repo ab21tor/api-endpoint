@@ -27,7 +27,7 @@ BITCOIN_TAG = bytes.fromhex("0588960d73d71901")
 # The two other block-header attestations the public client knows and
 # reads as one varuint height: no usable attestation for the readers here,
 # which report them as unknown, but a payload the client refuses is
-# refused by them too (2026-09-18 cold review R09).
+# refused by them too.
 LITECOIN_TAG = bytes.fromhex("06869a0d73d71b45")
 ETHEREUM_TAG = bytes.fromhex("30fe8087b5c7ead7")
 DIGEST = bytes(range(32))

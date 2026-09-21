@@ -6,8 +6,8 @@ fingerprinted in memory (raw bytes are never written and never logged) and
 each fingerprint gets its own OpenTimestamps proof, in one of two shapes:
 
   hosted    GATEWAY_URL  — bought from a Lightning-paid L402 timestamp
-                           gateway, paid via the payer phoenixd (or handed
-                           over by the gateway's free door);
+                           gateway, paid via the payer phoenixd (a proof
+                           handed over unpaid is accepted too);
   appliance CALENDAR_URL — submitted straight to the box's own calendar
                            (the opentimestamps-server fork's counted
                            /digest), no payment anywhere.
@@ -48,24 +48,23 @@ HEX64_ANYCASE = re.compile(r"[0-9a-fA-F]{64}")
 # block-header attestation is decided by deserialising the whole proof and
 # inspecting its attestation nodes (inspect_proof), never by scanning the
 # bytes for the tag: a chosen digest or an operand can contain those nine
-# bytes (2026-09-15 review, "structural parsing is called Bitcoin
-# verification"). Checked against a real anchored proof and a real pending
-# proof in the tests.
+# bytes. Checked against a real anchored proof and a real pending proof in
+# the tests.
 OTS_MAGIC = b"\x00OpenTimestamps\x00\x00Proof\x00\xbf\x89\xe2\xe8\x84\xe8\x92\x94"
 BITCOIN_TAG = bytes.fromhex("0588960d73d71901")
 BITCOIN_ATTESTATION = b"\x00" + BITCOIN_TAG
 # The other two block-header attestations the public client knows
 # (LitecoinBlockHeaderAttestation; EthereumBlockHeaderAttestation under
 # dubious/). Their payload is one varuint height, read to its end exactly
-# as the client reads it; they are not usable attestations here and read
-# as unknown (2026-09-18 cold review R09: they used to be opaque, so an
-# empty or trailing payload the client refuses parsed, and beside a
-# Bitcoin node made a proof bitcoin_attestation_present).
+# as the client reads it, so an empty or trailing payload the client
+# refuses is refused here too (beside a Bitcoin node it would otherwise
+# make a proof bitcoin_attestation_present); they are not usable
+# attestations here and read as unknown.
 HEIGHT_TAGS = (BITCOIN_TAG, bytes.fromhex("06869a0d73d71b45"), bytes.fromhex("30fe8087b5c7ead7"))
 
 # OpenTimestamps proof bytes, the subset a single calendar emits — a COPY of
-# the parser in the fork's ops/selfstamp.py (2026-09-11), kept here because
-# this file is one stdlib file with no sibling to import from. The two
+# the parser in the fork's ops/selfstamp.py, kept here because this file
+# is one stdlib file with no sibling to import from. The two
 # copies are held to the same corpus (proof_corpus.py) against the
 # opentimestamps library by their tests; a change to one is a change to
 # both. docs/contracts.md, "The proof parser": what "parses" means here.
@@ -94,8 +93,8 @@ Proof = collections.namedtuple("Proof", "digest commitment attestation ops_end")
 
 class OtsError(Exception):
     """A proof this adapter cannot read or must not write. The only error
-    the readers below raise, whatever the bytes (2026-09-15/16 review
-    F13: an IndexError escaped and stopped the startup reconciliation)."""
+    the readers below raise, whatever the bytes, so that no stored file
+    can stop the startup reconciliation with an error nobody catches."""
 
 
 def varuint(n):
@@ -141,8 +140,8 @@ def read_varbytes(data, pos, max_len, min_len=0):
 def read_attestation(data, pos):
     """The attestation whose marker byte was just read: (kind, value, end).
     A known payload (pending, and the three block-header tags) is consumed
-    to its last byte (2026-09-15/16 review F03: a byte after the height, or
-    no height at all, used to pass); a pending URI is at most MAX_URI bytes
+    to its last byte (a byte after the height, or no height at all, is
+    refused); a pending URI is at most MAX_URI bytes
     of URI_CHARS; only Bitcoin is a usable attestation; every other tag,
     the Litecoin and Ethereum ones included, is kept as ("unknown", tag
     hex), which parses and is no usable attestation."""
@@ -432,7 +431,7 @@ def resolve_config(environ, script_dir=SCRIPT_DIR):
         )
 
     # The shape: exactly one of the two doors. GATEWAY_URL is the hosted
-    # shape (an L402 timestamp gateway, paid or free door); CALENDAR_URL is
+    # shape (an L402 timestamp gateway); CALENDAR_URL is
     # the appliance shape (the box's own calendar, submitted to directly,
     # nothing paid anywhere).
     gateway = get("GATEWAY_URL")
@@ -451,7 +450,7 @@ def resolve_config(environ, script_dir=SCRIPT_DIR):
             "submits to directly (appliance shape); exactly one"
         )
     mode = "calendar" if calendar else "gateway"
-    # The appliance defaults (2026-09-11): eight submissions in the air and
+    # The appliance defaults: eight submissions in the air and
     # one upgrade pass an hour (each pass is one loopback GET per pending
     # proof). The hosted defaults are unchanged: serial, ten minutes.
     inflight_default = "8" if mode == "calendar" else "1"
@@ -470,8 +469,7 @@ def resolve_config(environ, script_dir=SCRIPT_DIR):
         except (TypeError, ValueError):
             raise ConfigError(f"{key} must be a number of seconds, got {raw!r}")
         # Finite as well as positive: float() reads 'inf', and time.sleep
-        # refuses it later, outside the worker's catch (2026-09-18 cold
-        # review R19).
+        # refuses it later, outside the worker's catch.
         if not (math.isfinite(v) and v > 0):
             raise ConfigError(f"{key} must be a positive, finite number of seconds, got {raw!r}")
         return v
@@ -498,10 +496,10 @@ def resolve_config(environ, script_dir=SCRIPT_DIR):
         "upgrade_secs": secs("UPGRADE_SECS", upgrade_secs_default),
         "heartbeat_secs": secs("HEARTBEAT_SECS", "10"),
         "l402_expiry_secs": secs("L402_EXPIRY_SECS", "3600"),
-        # J9 (2026-09-08): a paid-but-unredeemed sidecar is retried every
-        # pass this many times, then marked needs-attention and retried
-        # once per redeem_attention_retry_secs — never dropped, never
-        # re-paid, and no longer one log line per pass forever.
+        # A paid-but-unredeemed sidecar is retried every pass this many
+        # times, then marked needs-attention and retried once per
+        # redeem_attention_retry_secs — never dropped, never re-paid, and
+        # not one log line per pass forever.
         "redeem_attempts_max": pint("REDEEM_ATTEMPTS_MAX", "300"),
         "redeem_attention_retry_secs": secs("REDEEM_ATTENTION_RETRY_SECS", "3600"),
         "breaker_failures": uint("CIRCUIT_BREAKER_FAILURES", "5"),
@@ -572,8 +570,8 @@ def log_event(cfg, event, **kv):
 # durable writes
 def fsync_dir(path):
     """fsync a directory so a new entry or a rename is durable. Raises: a
-    directory that cannot be synced is a failure the caller must see (the
-    2026-09-15 review found a swallowed EIO reported as success)."""
+    directory that cannot be synced is a failure the caller must see, never
+    an EIO swallowed and reported as success."""
     fd = os.open(path, os.O_RDONLY)
     try:
         os.fsync(fd)
@@ -588,8 +586,8 @@ def fsync_existing(path):
     pass that acts on a file it finds (acknowledges the debt, clears the
     debt behind the proof, clears the marker behind the upgrade) repeats
     the barrier first, under the fingerprint's lock, and does not act if
-    the barrier fails again (2026-09-18 cold review R02: the retry used to
-    take the file's presence for the barrier having held). Raises OSError."""
+    the barrier fails again; the file's presence is never taken for the
+    barrier having held. Raises OSError."""
     fd = os.open(path, os.O_RDONLY)
     try:
         os.fsync(fd)
@@ -1015,8 +1013,8 @@ def write_debt(cfg, fp):
     fsynced again, with its directory, before it is answered as owed: the
     file may be the remainder of a 500 whose barrier and whose cleanup
     both failed, and a retry that acknowledged it by its presence promised
-    what nothing had made durable (2026-09-18 cold review R02). Must
-    complete before 'received' goes out — the debt is the promise."""
+    what nothing had made durable. Must complete before 'received' goes
+    out — the debt is the promise."""
     path = debt_path(cfg, fp)
     with fp_lock(fp):
         try:
@@ -1123,11 +1121,10 @@ def _report_missing_proof(cfg, fp):
     debt is written for it: a proof bought now would carry a later bound
     and is not the one promised, so only a copy of the original, put back
     under the marker, resolves it, and the upgrader then resumes from the
-    marker. Before 2026-09-21 the marker was dropped here and by the
-    start's reconciliation, and the promise vanished without a trace
-    (year-of-operation review, scenario 18). The lock guard is the
-    2026-09-15 review's race: the upgrader dropped the marker between the
-    buyer's marker and its proof write, stranding the proof forever."""
+    marker. Dropping the marker would make the promise vanish without a
+    trace. The lock guard closes a race: without it the upgrader could
+    drop the marker between the buyer's marker and its proof write,
+    stranding the proof forever."""
     lock = fp_lock(fp)
     if not lock.acquire(blocking=False):
         return
@@ -1149,11 +1146,10 @@ def pending_clear(cfg, fp):
 
 def list_pending(cfg):
     """The fingerprints in the pending index. Raises OSError when the
-    directory cannot be listed: work that cannot be seen is not no work
-    (2026-09-18 cold review R16: the error used to read as an empty index,
-    and the upgrader's pass ended as if nothing were pending). The
-    upgrader's loop logs the error and asks again next pass; the start
-    fails on it."""
+    directory cannot be listed: work that cannot be seen is not no work,
+    and an error read as an empty index would end the upgrader's pass as
+    if nothing were pending. The upgrader's loop logs the error and asks
+    again next pass; the start fails on it."""
     return sorted(n for n in os.listdir(cfg["pending_dir"]) if HEX64.fullmatch(n))
 
 
@@ -1189,9 +1185,9 @@ def build_pending_index(cfg):
 
 def reconcile_state(cfg):
     """Every start, before any thread: the debts, the proofs and the
-    pending index are made to agree, so an installation stranded by the
-    marker race or by a header-only "proof" (both possible before
-    2026-09-15, .built or not) is repaired. Each proof is deserialised
+    pending index are made to agree, so an installation stranded by an
+    earlier release (the marker race, a header-only "proof", .built or
+    not) is repaired. Each proof is deserialised
     whole: a PENDING proof without a marker gets one back
     (`pending_marker_restored`); a proof with a Bitcoin attestation loses a
     stale marker; INVALID bytes get their debt re-created first and are
@@ -1203,10 +1199,9 @@ def reconcile_state(cfg):
     it is resolved): the last sign of a promise whose proof is gone, an
     external deletion or an incomplete restore; no debt is written for
     it, since a proof bought now is not the one promised, and a copy of
-    the original put back under the marker is what resolves it (before
-    2026-09-21 the marker was dropped, and the promise vanished without a
-    trace: year-of-operation review, scenario 18). A data directory from
-    before the index (.built absent) gets its markers here, logged once
+    the original put back under the marker is what resolves it. A data
+    directory from before the index (.built absent) gets its markers
+    here, logged once
     as `pending_index_built`. Every step is idempotent: a stop anywhere
     leaves a state the next start repairs the same way. Returns the
     counts."""
@@ -1240,8 +1235,7 @@ def reconcile_state(cfg):
             # directory fsynced) before the bytes that failed to be a
             # proof are moved out of the way. A stop or a failed write
             # between the two leaves the invalid proof in place, found
-            # again next start; never an aside file alone (2026-09-15/16
-            # review F01).
+            # again next start; never an aside file alone.
             write_debt(cfg, fp)
             aside = path + ".invalid-%d" % int(time.time())
             os.replace(path, aside)
@@ -1249,8 +1243,8 @@ def reconcile_state(cfg):
             log_event(cfg, "proof_invalid_requeued", fp=fp, reason=reason)
             counts["invalid_requeued"] += 1
     # An aside file with neither a proof nor a debt for its fingerprint:
-    # the code before 2026-09-16 moved the bytes before it wrote the debt
-    # and stopped between the two. The bytes were once stored as this
+    # an earlier release moved the bytes before it wrote the debt and
+    # stopped between the two. The bytes were once stored as this
     # fingerprint's proof, so the record was acknowledged; the debt is
     # recreated and the buyer fetches a proper proof.
     for fp in sorted({name[:64] for name in os.listdir(cfg["proofs_dir"])
@@ -1297,8 +1291,8 @@ def load_sidecar(path):
 
 def write_sidecar(path, macaroon, invoice, preimage=None, attempts=0, attention=None,
                   payment_hash=None, amount_sats=None):
-    """The in-flight purchase record. payment_hash and amount_sats (since
-    2026-09-15) are the invoice's own, decoded by phoenixd, so a retry can
+    """The in-flight purchase record. payment_hash and amount_sats are the
+    invoice's own, decoded by phoenixd, so a retry can
     ask the wallet what became of the payment and reserve the amount again;
     attempts counts definite redeem refusals of a paid preimage; attention
     is the UTC time the ceiling was reached (the operator's signal: the box
@@ -1472,8 +1466,8 @@ def finish_sidecar(cfg, password, fp, sc, age, flags):
     preimage, no payment, no reservation; unknown: wait); only a
     definitely unpaid invoice is paid again, and it reserves TODAY's budget
     before the payinvoice call — the budget counts every call, not every
-    invoice (2026-09-15 review, A7: an invoice reserved yesterday could
-    settle today with today's whole budget still open). The STORED invoice
+    invoice, or an invoice reserved yesterday could settle today with
+    today's whole budget still open. The STORED invoice
     is re-paid, never a fresh challenge, until L402_EXPIRY_SECS; then the
     challenge is abandoned loudly (the one edge where a double charge cannot
     be ruled out)."""
@@ -1519,8 +1513,8 @@ def _retry_stored_invoice(cfg, password, fp, sc, macaroon, invoice, flags):
     if not isinstance(amt, int) or isinstance(amt, bool):
         amt = None
     if payment_hash is None or amt is None:
-        # A sidecar from before 2026-09-15 carries neither: read them off the
-        # stored invoice itself.
+        # A sidecar written by an earlier release carries neither: read
+        # them off the stored invoice itself.
         try:
             decoded_amt, decoded_hash = decode_invoice(cfg, password, invoice)
         except Unreachable:
@@ -1667,14 +1661,14 @@ def buy_one(cfg, password, fp, flags):
 
 
 def _buy_challenged(cfg, password, fp, status, headers, body, day, spent, flags):
-    """The gateway has answered a challenge for fp: the free door hands the
-    proof over, 429 rate-limits the pass, 402 enters the paid machinery
+    """The gateway has answered a challenge for fp: a 200 with the proof
+    hands it over, 429 rate-limits the pass, 402 enters the paid machinery
     (decode, ceilings, reserve, sidecar, pay, redeem). day/spent are the
     ledger as read by the preflight that preceded THIS call — nothing may
     have reserved against the ledger in between."""
     if status == 200 and looks_like_ots(body):
-        # The gateway handed the proof over without charging: its free door
-        # (L402_ENABLED=false), or the calendar's answer. The bytes are
+        # The proof came without a charge: the calendar's answer, or a
+        # gateway that does not charge. The bytes are
         # deserialised whole and their attestation nodes inspected before
         # anything is stored or the debt touched.
         state, reason = inspect_proof(body, fp)
@@ -1767,8 +1761,8 @@ def _buyer_pass_inflight(cfg, password, flags):
     ride in flight at once, oldest debts first. The worker threads do only
     the HTTP call; every response is handled here on the buyer thread, so
     the files, the ledger, the log and the flags are touched by one thread
-    exactly as at INFLIGHT=1. A free-door answer (200 + ots) completes as
-    today. The first sign of the paid door — a 402, or a sidecar already on
+    exactly as at INFLIGHT=1. An unpaid answer (200 + ots) completes as at
+    INFLIGHT=1. The first sign of the paid door — a 402, or a sidecar already on
     disk — ends the concurrent phase: the outstanding answers are collected,
     then that debt and every remaining debt go one at a time through the
     same paid machinery buy_one uses. Payments are never concurrent. A
@@ -2158,8 +2152,8 @@ def make_handler(cfg):
 class DoorServer(ThreadingHTTPServer):
     """The base class's handle_error prints 'Exception occurred during
     processing of request from (IP, port)' and a traceback to stderr, which
-    the unit keeps: a client identity on disk (2026-09-15 review, A11).
-    Here the exception class alone is logged, as a fixed event."""
+    the unit keeps: a client identity on disk. Here the exception class
+    alone is logged, as a fixed event."""
 
     def __init__(self, address, handler, cfg):
         self.cfg = cfg
