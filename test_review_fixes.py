@@ -225,17 +225,21 @@ class TestCompletion(UnitBase):
         self.assertFalse(self.exists("debt"))
         self.assertTrue(self.exists("marker"))
 
-    def test_a_marker_without_proof_is_kept_while_the_debt_exists_and_dropped_when_nothing_can_write_it(self):
+    def test_a_marker_without_proof_is_silent_while_the_debt_exists_and_kept_and_reported_when_nothing_can_write_it(self):
         a.write_debt(self.cfg, self.fp)
         a.pending_mark(self.cfg, self.fp)
         with patch.object(a, "upgrade_proof", return_value=pending_answer()):
             a.upgrade_pass(self.cfg, {"upgrade_gateway": a.StateChange()})
         self.assertTrue(self.exists("marker"), "a debt exists: the proof is still coming")
+        self.assertNotIn("proof_missing", self.log())
         a.clear_debt(self.cfg, self.fp)
-        with patch.object(a, "upgrade_proof", return_value=pending_answer()):
+        with patch.object(a, "upgrade_proof", return_value=pending_answer()) as upgrade:
             a.upgrade_pass(self.cfg, {"upgrade_gateway": a.StateChange()})
-        self.assertFalse(self.exists("marker"))
-        self.assertIn("stale_marker_dropped", self.log())
+        self.assertTrue(self.exists("marker"), "the promise's last sign stays (2026-09-21, scenario 18)")
+        self.assertFalse(self.exists("debt"), "no proof is bought in the original's place")
+        self.assertIn("proof_missing fp=" + self.fp, self.log())
+        self.assertNotIn("stale_marker_dropped", self.log())
+        upgrade.assert_not_called()
 
     def test_marker_creation_failure_is_fatal_to_the_completion(self):
         real_open = os.open
@@ -334,18 +338,92 @@ class TestReconciliation(UnitBase):
         a.pending_mark(self.cfg, "ee" * 32)                                          # nothing behind it
         counts = a.reconcile_state(self.cfg)
         self.assertEqual(counts, {"markers_restored": 1, "markers_cleared": 1, "invalid_requeued": 1,
-                                  "stale_markers_dropped": 1})
+                                  "proofs_missing": 1})
         self.assertTrue(self.exists("marker", stranded))
         self.assertFalse(self.exists("marker", stale))
         self.assertFalse(self.exists("proof", invalid))
         self.assertTrue(any(p.name.startswith(invalid + ".ots.invalid-") for p in Path(self.cfg["proofs_dir"]).iterdir()))
         self.assertTrue(self.exists("debt", invalid))
         self.assertTrue(self.exists("marker", fine))
-        self.assertFalse(self.exists("marker", "ee" * 32))
+        self.assertTrue(self.exists("marker", "ee" * 32), "a marker with nothing behind it is kept, reported")
+        self.assertFalse(self.exists("debt", "ee" * 32))
         self.assertIn("pending_marker_restored fp=" + stranded, self.log())
         self.assertIn("proof_invalid_requeued fp=" + invalid, self.log())
-        self.assertEqual(a.reconcile_state(self.cfg), {}, "a second pass finds nothing to do")
+        self.assertIn("proof_missing fp=" + "ee" * 32, self.log())
+        self.assertEqual(a.reconcile_state(self.cfg), {"proofs_missing": 1},
+                         "a second pass repairs nothing and reports the missing proof again")
         self.assertTrue(Path(self.cfg["pending_dir"], a.PENDING_BUILT).exists())
+
+
+class TestMissingPromisedProof(UnitBase):
+    """2026-09-21 year-of-operation review, scenario 18: a legitimately
+    stored pending proof removed from outside (an accidental deletion, an
+    incomplete restore), its debt long gone. The marker is the promise's
+    last sign. Both entry points used to drop it (the upgrader through
+    _drop_stale_marker, the start through the reconciliation), and the
+    promise vanished without a trace. Now both keep it and report
+    `proof_missing`; neither writes a debt, since a proof bought now would
+    carry a later bound and is not the one promised; a copy of the
+    original put back under the marker resumes the upgrade.
+
+    Fault model: the review's probe: the proof unlinked after store_proof
+    through the real functions, the loss asserted to have happened; not a
+    crash under working fsync."""
+
+    def promised_then_lost(self):
+        a.write_debt(self.cfg, self.fp)
+        self.assertTrue(a.store_proof(self.cfg, self.fp, pending(self.fp)))
+        self.assertTrue(self.exists("proof") and self.exists("marker") and not self.exists("debt"))
+        Path(a.proof_path(self.cfg, self.fp)).unlink()
+        self.assertFalse(self.exists("proof"), "the external loss fired")
+
+    def still_owed(self):
+        self.assertTrue(self.exists("marker"), "keep the last pending indicator until recovery is resolved")
+        self.assertFalse(self.exists("debt"), "no proof is bought in the original's place")
+        self.assertFalse(self.exists("proof"))
+        self.assertIn("proof_missing fp=" + self.fp, self.log())
+        self.assertNotIn("stale_marker_dropped", self.log())
+
+    def test_the_upgrader_keeps_and_reports_it(self):
+        self.promised_then_lost()
+        with patch.object(a, "http_get", return_value=(404, {}, b"Pending")) as get:
+            a.upgrade_pass(self.cfg, {"upgrade_gateway": a.StateChange()})
+        self.still_owed()
+        get.assert_not_called()
+        self.assertNotIn("upgrade_pass", self.log(), "nothing was checked")
+        # Every pass, not once: the obligation stays visible.
+        with patch.object(a, "http_get", return_value=(404, {}, b"Pending")):
+            a.upgrade_pass(self.cfg, {"upgrade_gateway": a.StateChange()})
+        self.assertEqual(self.log().count("proof_missing fp=" + self.fp), 2)
+
+    def test_the_start_keeps_and_reports_it(self):
+        self.promised_then_lost()
+        self.assertEqual(a.reconcile_state(self.cfg), {"proofs_missing": 1})
+        self.still_owed()
+        self.assertEqual(a.reconcile_state(self.cfg), {"proofs_missing": 1}, "reported at every start until resolved")
+
+    def test_the_present_proof_control(self):
+        a.write_debt(self.cfg, self.fp)
+        self.assertTrue(a.store_proof(self.cfg, self.fp, pending(self.fp)))
+        with patch.object(a, "http_get", return_value=(404, {}, b"Pending")):
+            a.upgrade_pass(self.cfg, {"upgrade_gateway": a.StateChange()})
+        self.assertEqual(a.reconcile_state(self.cfg), {})
+        self.assertTrue(self.exists("marker") and self.exists("proof") and not self.exists("debt"))
+        self.assertNotIn("proof_missing", self.log())
+
+    def test_a_copy_of_the_original_put_back_resumes_the_upgrade(self):
+        self.promised_then_lost()
+        a.reconcile_state(self.cfg)
+        Path(a.proof_path(self.cfg, self.fp)).write_bytes(pending(self.fp))
+        self.assertEqual(a.reconcile_state(self.cfg), {}, "nothing is missing any more")
+        good = (200, {}, json.dumps({"status": "anchored", "bitcoin_anchored": True,
+                                     "ots": base64.b64encode(anchored(self.fp)).decode()}).encode())
+        with patch.object(a, "upgrade_proof", return_value=good) as upgrade:
+            a.upgrade_pass(self.cfg, {"upgrade_gateway": a.StateChange()})
+        upgrade.assert_called_once()
+        self.assertFalse(self.exists("marker"))
+        self.assertTrue(a.bitcoin_attestation_present(Path(a.proof_path(self.cfg, self.fp)).read_bytes()))
+        self.assertIn("bitcoin_attestation_present fp=" + self.fp, self.log())
 
 
 class TestReconciliationAtStartup(IntegrationBase):

@@ -1114,12 +1114,20 @@ def proof_on_disk(cfg, fp):
     return inspect_proof(data, fp)[0] != INVALID
 
 
-def _drop_stale_marker(cfg, fp):
-    """A marker whose proof is absent is dropped only when nothing can
-    still write that proof: no debt, no sidecar, and no buyer mid-way (the
-    fingerprint's lock is taken without waiting; held means in flight).
-    The 2026-09-15 review's race: the upgrader dropped the marker between
-    the buyer's marker and its proof write, stranding the proof forever."""
+def _report_missing_proof(cfg, fp):
+    """A marker whose proof is absent, when nothing can still write that
+    proof (no debt, no sidecar, no buyer mid-way: the fingerprint's lock
+    is taken without waiting, held means in flight), is the last sign of
+    a promise whose proof is gone: an external deletion, an incomplete
+    restore. It is kept and reported (`proof_missing`), every pass, and no
+    debt is written for it: a proof bought now would carry a later bound
+    and is not the one promised, so only a copy of the original, put back
+    under the marker, resolves it, and the upgrader then resumes from the
+    marker. Before 2026-09-21 the marker was dropped here and by the
+    start's reconciliation, and the promise vanished without a trace
+    (year-of-operation review, scenario 18). The lock guard is the
+    2026-09-15 review's race: the upgrader dropped the marker between the
+    buyer's marker and its proof write, stranding the proof forever."""
     lock = fp_lock(fp)
     if not lock.acquire(blocking=False):
         return
@@ -1127,8 +1135,7 @@ def _drop_stale_marker(cfg, fp):
         if os.path.exists(proof_path(cfg, fp)) or os.path.exists(debt_path(cfg, fp)) \
                 or os.path.exists(sidecar_path(cfg, fp)):
             return
-        pending_clear(cfg, fp)
-        log_event(cfg, "stale_marker_dropped", fp=fp)
+        log_event(cfg, "proof_missing", fp=fp)
     finally:
         lock.release()
 
@@ -1191,11 +1198,18 @@ def reconcile_state(cfg):
     then set aside as <fp>.ots.invalid-<time>, so the buyer fetches a
     proper proof (`proof_invalid_requeued`); an aside file left alone by
     an earlier version gets its debt back (`aside_requeued`). A marker
-    with neither proof nor debt nor sidecar is dropped. A data directory
-    from before the index (.built absent) gets its markers here, logged
-    once as `pending_index_built`. Every step is idempotent: a stop
-    anywhere leaves a state the next start repairs the same way. Returns
-    the counts."""
+    with neither proof nor debt nor sidecar is kept and reported
+    (`proof_missing`, counted as `proofs_missing`, at every start until
+    it is resolved): the last sign of a promise whose proof is gone, an
+    external deletion or an incomplete restore; no debt is written for
+    it, since a proof bought now is not the one promised, and a copy of
+    the original put back under the marker is what resolves it (before
+    2026-09-21 the marker was dropped, and the promise vanished without a
+    trace: year-of-operation review, scenario 18). A data directory from
+    before the index (.built absent) gets its markers here, logged once
+    as `pending_index_built`. Every step is idempotent: a stop anywhere
+    leaves a state the next start repairs the same way. Returns the
+    counts."""
     counts = collections.Counter()
     first_index = not os.path.exists(os.path.join(cfg["pending_dir"], PENDING_BUILT))
     scanned = pending = 0
@@ -1248,8 +1262,8 @@ def reconcile_state(cfg):
     for fp in list_pending(cfg):
         if not (os.path.exists(proof_path(cfg, fp)) or os.path.exists(debt_path(cfg, fp))
                 or os.path.exists(sidecar_path(cfg, fp))):
-            pending_clear(cfg, fp)
-            counts["stale_markers_dropped"] += 1
+            log_event(cfg, "proof_missing", fp=fp)
+            counts["proofs_missing"] += 1
     fsync_dir(cfg["pending_dir"])
     fsync_dir(cfg["proofs_dir"])
     fd = os.open(os.path.join(cfg["pending_dir"], PENDING_BUILT), os.O_WRONLY | os.O_CREAT, 0o600)
@@ -1944,7 +1958,7 @@ def upgrade_pass(cfg, flags):
                     with open(path, "rb") as f:
                         data = f.read()
                 except FileNotFoundError:
-                    _drop_stale_marker(cfg, fp)  # never while a debt exists or a buyer is mid-way
+                    _report_missing_proof(cfg, fp)  # the marker stays; silent while a debt, a sidecar or a buyer mid-way can still write the proof
                     continue
                 except OSError:
                     continue

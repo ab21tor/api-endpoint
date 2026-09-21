@@ -140,7 +140,7 @@ Whatever can reach `LISTEN_ADDR` can submit records and, with
 | `debts/<fp>` | owed fingerprint; written and fsynced before "received" goes out |
 | `debts/<fp>.l402` | in-flight purchase: the L402 challenge with the invoice's own `payment_hash` and `amount_sats` (decoded by phoenixd), plus the preimage once paid; `attempts` / `attention` once the gateway keeps refusing that preimage |
 | `proofs/<fp>.ots` | the proof: `pending` while its attestations name a calendar, `bitcoin_attestation_present` once an attestation node names a Bitcoin block (decided by deserialising the whole file, never by scanning its bytes) |
-| `pending/<fp>` | empty marker for a proof still waiting for its Bitcoin attestation, written and fsynced before the proof and removed once bytes with the attestation are on disk; the upgrader works from this index and never re-reads the proofs directory, and drops a marker whose proof is absent only when no debt, no sidecar and no buyer mid-way can still write it; every start reconciles the index against the proofs ("Recover") |
+| `pending/<fp>` | empty marker for a proof still waiting for its Bitcoin attestation, written and fsynced before the proof and removed once bytes with the attestation are on disk; the upgrader works from this index and never re-reads the proofs directory, and never drops a marker whose proof is absent: silent while a debt, a sidecar or a buyer mid-way can still write it, else the marker is kept and `proof_missing` logged every pass ("Recover"); every start reconciles the index against the proofs ("Recover") |
 | `ledger` | one line `YYYY-MM-DD SPENT_SATS` per UTC day: attempts, not successes |
 | `heartbeat` | one line: time, pid, buyer and upgrader last-pass times, breaker state, `attention=N` paid-but-refused sidecars at the retry ceiling |
 | `log` | append-only fixed-format events |
@@ -364,7 +364,16 @@ get their debt re-created first, durably, and are then set aside as
 (`proof_invalid_requeued`); an aside file found with neither a proof nor
 a debt for its fingerprint (left by the code before 2026-09-16, which
 moved the bytes before it wrote the debt) gets its debt back
-(`aside_requeued`); a marker with neither proof nor debt is dropped.
+(`aside_requeued`); a marker with neither proof nor debt is kept and
+reported (`proof_missing`, counted in `reconciled` as `proofs_missing`,
+at every start and by the upgrader every pass until it is resolved): it
+is the last sign of a promise whose proof is gone, an accidental
+deletion or an incomplete restore, and the adapter never buys a proof in
+its place, since one bought now carries a later bound and is not the one
+promised; a copy of the original put back as `proofs/<fp>.ots` is what
+resolves it, and the upgrader then resumes from the marker (2026-09-21
+year-of-operation review, scenario 18: the marker used to be dropped,
+and the promise vanished without a trace).
 Every step is idempotent, so a stop anywhere in the repair is repaired
 again the same way at the next start; a parser given any bytes answers
 `INVALID`, never an exception (2026-09-15/16 review F01, F13). This
