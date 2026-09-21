@@ -1,16 +1,16 @@
-"""The 2026-09-15 independent review's adapter findings, as regressions.
+"""Adapter regressions: promises kept across stops, races and bad bytes.
 
-A1: the buyer/upgrader race stranded an unanchored proof (a marker whose
-proof was absent was dropped while the debt existed; a marker that could
-not be created was ignored). A2: intake acknowledged a debt on filename
-existence while the original write was unfinished, and directory fsync
-errors were swallowed. A6: a nine-byte scan called any bytes anchored, and
-a header-only file was stored as a proof. A11: a client disconnect went
-through the inherited server error path, which prints the peer to stderr.
+The failure modes pinned: a buyer/upgrader race stranding an unanchored
+proof (a marker whose proof is absent dropped while the debt exists; a
+marker that cannot be created ignored); intake acknowledging a debt on
+filename existence while the original write is unfinished, or with a
+directory fsync error swallowed; a nine-byte scan calling any bytes
+anchored, and a header-only file stored as a proof; a client disconnect
+going through the inherited server error path, which prints the peer to
+stderr.
 
-Each test here fails against da72b6b and passes now. Failure injection at
-the write boundary and a killed process are what these tests do; a power
-cut is not simulated.
+Failure injection at the write boundary and a killed process are what
+these tests do; a power cut is not simulated.
 """
 import base64
 import contextlib
@@ -235,7 +235,7 @@ class TestCompletion(UnitBase):
         a.clear_debt(self.cfg, self.fp)
         with patch.object(a, "upgrade_proof", return_value=pending_answer()) as upgrade:
             a.upgrade_pass(self.cfg, {"upgrade_gateway": a.StateChange()})
-        self.assertTrue(self.exists("marker"), "the promise's last sign stays (2026-09-21, scenario 18)")
+        self.assertTrue(self.exists("marker"), "the promise's last sign stays")
         self.assertFalse(self.exists("debt"), "no proof is bought in the original's place")
         self.assertIn("proof_missing fp=" + self.fp, self.log())
         self.assertNotIn("stale_marker_dropped", self.log())
@@ -356,17 +356,16 @@ class TestReconciliation(UnitBase):
 
 
 class TestMissingPromisedProof(UnitBase):
-    """2026-09-21 year-of-operation review, scenario 18: a legitimately
-    stored pending proof removed from outside (an accidental deletion, an
-    incomplete restore), its debt long gone. The marker is the promise's
-    last sign. Both entry points used to drop it (the upgrader through
-    _drop_stale_marker, the start through the reconciliation), and the
-    promise vanished without a trace. Now both keep it and report
-    `proof_missing`; neither writes a debt, since a proof bought now would
-    carry a later bound and is not the one promised; a copy of the
-    original put back under the marker resumes the upgrade.
+    """A legitimately stored pending proof removed from outside (an
+    accidental deletion, an incomplete restore), its debt long gone. The
+    marker is the promise's last sign: were either entry point (the
+    upgrader, the start's reconciliation) to drop it, the promise would
+    vanish without a trace. Both keep it and report `proof_missing`;
+    neither writes a debt, since a proof bought now would carry a later
+    bound and is not the one promised; a copy of the original put back
+    under the marker resumes the upgrade.
 
-    Fault model: the review's probe: the proof unlinked after store_proof
+    Fault model: the proof unlinked after store_proof
     through the real functions, the loss asserted to have happened; not a
     crash under working fsync."""
 
@@ -501,11 +500,11 @@ class TestQuietServer(unittest.TestCase):
 
 
 class TestOldSidecarReservation(UnitBase):
-    """A7 (carried, fixed 2026-09-15): an unpaid sidecar from an earlier day
-    was re-paid against its old reservation, so today's whole budget stayed
-    open beside it, and the retry never asked the wallet whether the earlier
-    call had in fact settled. Now the wallet is asked first, and a
-    definitely unpaid invoice reserves today's budget before payinvoice."""
+    """An unpaid sidecar from an earlier day must not be re-paid against
+    its old reservation, with today's whole budget open beside it and the
+    wallet never asked whether the earlier call had in fact settled. The
+    wallet is asked first, and a definitely unpaid invoice reserves
+    today's budget before payinvoice."""
 
     def old_sidecar(self, with_hash=True):
         self.cfg.update(mode="gateway", daily_budget_sats=10)
@@ -598,11 +597,11 @@ class TestOldSidecarReservation(UnitBase):
 
 
 class TestReconciliationOrder(UnitBase):
-    """F01 (2026-09-15/16 review): the reconciliation moved an invalid
-    proof aside and only then wrote the debt. A failed debt write, or a
-    stop between the two, left an aside file nobody reads and no debt: a
-    promised proof, lost. Now the debt is durable before the bytes move,
-    and an aside file found alone recreates the debt. Exception injection
+    """Were the reconciliation to move an invalid proof aside and only
+    then write the debt, a failed debt write, or a stop between the two,
+    would leave an aside file nobody reads and no debt: a promised proof,
+    lost. The debt is durable before the bytes move, and an aside file
+    found alone recreates the debt. Exception injection
     at the write boundary; not a power cut."""
 
     def aside_files(self):
@@ -659,11 +658,11 @@ class TestReconciliationOrder(UnitBase):
 
 
 class TestParserBounds(UnitBase):
-    """F13 and F03 (2026-09-15/16 review): a final fork marker indexed
-    past the end and raised IndexError out of the startup reconciliation;
-    attestation payloads were read for their first field only, so bytes
-    the public client refuses cleared debts. inspect_proof never raises,
-    and every payload is consumed to its end."""
+    """A final fork marker must not index past the end and raise
+    IndexError out of the startup reconciliation; attestation payloads
+    read for their first field only would let bytes the public client
+    refuses clear debts. inspect_proof never raises, and every payload is
+    consumed to its end."""
 
     def test_a_trailing_fork_marker_is_invalid_not_a_crash(self):
         data = a.OTS_MAGIC + b"\x01\x08" + bytes.fromhex(self.fp) + b"\xff"
@@ -722,8 +721,7 @@ class TestParserBounds(UnitBase):
 
 
 class TestSmoke(unittest.TestCase):
-    """F21 (2026-09-15/16 review): the smoke script called
-    api_endpoint.is_anchored, removed on 2026-09-15."""
+    """The smoke script must name only functions that exist."""
 
     def test_the_smoke_script_names_only_functions_that_exist(self):
         import re
@@ -737,7 +735,7 @@ class TestSmoke(unittest.TestCase):
 
 
 class TestIntakeCleanup(UnitBase):
-    """Close-gate correction (2026-09-16): a debt that could not be made
+    """A debt that could not be made
     durable is removed and the door answers 500, but the removal can fail
     too, and its error was suppressed. The 500 therefore promises only
     that acceptance was not confirmed; a debt file may remain, which is
@@ -767,14 +765,14 @@ class TestIntakeCleanup(UnitBase):
 
 
 class TestResumedBarriers(UnitBase):
-    """A1, A2, A3 (2026-09-18 cold review R02): a file found on disk is
-    visible, not known durable. The write that made it may have failed at
-    its directory fsync, and until this change the pass that found it took
-    its presence for the barrier having held: intake answered `received`
-    for a debt left by a 500 whose barrier and cleanup both failed, the
-    buyer cleared the debt behind a proof whose barrier failed, the
-    upgrader cleared the marker behind a replacement whose barrier failed.
-    Now each repeats the barrier (fsync_existing: the file, then its
+    """A file found on disk is visible, not known durable. The write that
+    made it may have failed at its directory fsync, and a pass that took
+    its presence for the barrier having held would go wrong three ways:
+    intake answering `received` for a debt left by a 500 whose barrier
+    and cleanup both failed, the buyer clearing the debt behind a proof
+    whose barrier failed, the upgrader clearing the marker behind a
+    replacement whose barrier failed. Each repeats the barrier
+    (fsync_existing: the file, then its
     directory) under the fingerprint's lock before it acts, and does not
     act when the barrier fails again. Fault model: fsync_dir made to fail
     for one directory on every call, each injection counted (it fires on
@@ -888,10 +886,10 @@ class TestResumedBarriers(UnitBase):
 
 
 class TestPendingIndexListing(UnitBase):
-    """R16 (2026-09-18 cold review): a pending index that cannot be listed
-    used to read as an empty index, so an upgrader whose directory had
-    become unreadable found nothing to do, reported nothing, and went on
-    writing its heartbeat. Now the listing's error is raised: the
+    """A pending index that cannot be listed must not read as an empty
+    index, or an upgrader whose directory has become unreadable would find
+    nothing to do, report nothing, and go on writing its heartbeat. The
+    listing's error is raised: the
     upgrader's loop logs it (`upgrader_error`) and asks again next pass,
     the start fails on it, and only a listing that succeeded and is empty
     means no pending work. Fault model: os.listdir made to fail for the
@@ -955,11 +953,10 @@ class TestPendingIndexListing(UnitBase):
 
 
 class TestIntervalConfig(unittest.TestCase):
-    """R19 (2026-09-18 cold review): float() reads 'inf', and a positive
-    check let it through, so POLL_SECS=inf started a buyer whose
-    time.sleep raised OverflowError outside its catch. Every interval is
-    now a positive, finite number of seconds or a startup error naming
-    the setting."""
+    """float() reads 'inf', and a positive check alone would let it
+    through: POLL_SECS=inf would start a buyer whose time.sleep raises
+    OverflowError outside its catch. Every interval is a positive, finite
+    number of seconds or a startup error naming the setting."""
 
     INTERVALS = ("POLL_SECS", "UPGRADE_SECS", "HEARTBEAT_SECS", "L402_EXPIRY_SECS",
                  "REDEEM_ATTENTION_RETRY_SECS", "CIRCUIT_BREAKER_PAUSE_SECS")

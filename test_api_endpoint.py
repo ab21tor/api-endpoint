@@ -62,8 +62,8 @@ def _varbytes(b):
 
 def pending_ots(fp):
     """A complete pending proof: the digest attested by a calendar URI.
-    (Before 2026-09-15 this was a bare tag followed by text, which the
-    header check accepted; the adapter now deserialises the whole proof.)"""
+    (A bare tag followed by text is not one: the adapter deserialises the
+    whole proof.)"""
     b = OTS_HEAD + bytes.fromhex(fp) + CAL_TAG + _varbytes(_varbytes(b"http://fake-calendar/"))
     assert api_endpoint.BITCOIN_ATTESTATION not in b
     assert api_endpoint.inspect_proof(b, fp) == (api_endpoint.PENDING, "pending")
@@ -748,7 +748,7 @@ class IntegrationBase(unittest.TestCase):
         already_bought for it: each is written after clear_debt, so the
         proof, the debt and the sidecar are all in their final state. The
         proof's rename comes earlier and is not the end of the transition
-        (2026-09-15/16 review F22: assertions raced it)."""
+        (an assertion on the rename would race it)."""
         needles = tuple(f"{event} fp={fp}" for event in ("bought", "proof_free", "already_bought"))
         self.wait_until(lambda: any(n in self.read_service_log() for n in needles),
                         timeout=timeout, what=f"debt settled for {fp[:12]}")
@@ -1009,7 +1009,7 @@ class TestBuyerPolicy(IntegrationBase):
         # Heal: the STORED invoice is retried — no fresh challenge. The
         # wallet is asked first and reports the attempt failed, so the retry
         # is a second payinvoice call and reserves again: the budget counts
-        # calls, not invoices (2026-09-15 review, A7).
+        # calls, not invoices.
         challenges_before = self.gw.challenges_for(fp)
         self.ln.fail_pay_fps.discard(fp)
         self.wait_until(lambda: os.path.exists(self.proof_file(fp)),
@@ -1197,9 +1197,9 @@ class TestCorruptLedger(IntegrationBase):
         self.assertIn("purchases_resumed", self.read_service_log())
 
 
-# D5 (2026-09-08): a proof is only ever stored if it is a proof OF the
-# fingerprint this box asked about. The review's E-A1 shape: a gateway that
-# answers with a well-formed proof of somebody else's digest.
+# A proof is only ever stored if it is a proof OF the fingerprint this box
+# asked about. The shape: a gateway that answers with a well-formed proof
+# of somebody else's digest.
 class TestWrongDigestRefused(IntegrationBase):
     def test_proof_digest_reads_the_real_fixtures(self):
         with open(ANCHORED_REAL, "rb") as f:
@@ -1392,7 +1392,7 @@ class TestKillPayRedeemWindow(IntegrationBase):
 
 
 class TestRedeemCeiling(IntegrationBase):
-    """J9 (2026-09-08): a paid preimage the gateway keeps refusing (an L402
+    """A paid preimage the gateway keeps refusing (an L402
     secret rotation makes every stored macaroon a 401) is retried every pass
     up to REDEEM_ATTEMPTS_MAX times, then marked needs-attention in its
     sidecar and the heartbeat, logged once, and retried once per
@@ -1458,7 +1458,7 @@ class TestRedeemCeiling(IntegrationBase):
             self.assertNotIn("attempts", json.load(f))
 
 
-# D4 (2026-09-08): the client's proofs must finish. The upgrader works from an
+# The client's proofs must finish. The upgrader works from an
 # on-disk pending index (DATA_DIR/pending/<fp>, a marker written before the
 # proof and removed once the proof is anchored) instead of re-reading every
 # proof file each pass, presents GATEWAY_UPGRADE_TOKEN so the gateway lifts
@@ -1488,7 +1488,7 @@ class TestUpgradeBacklog(IntegrationBase):
             return None
 
     def test_upgrade_backlog_finishes_with_the_client_token(self):
-        """The review's D4 shape: a gateway that throttles anonymous /upgrade
+        """A gateway that throttles anonymous /upgrade
         to 5 per pass, 40 pending proofs on disk. With the token every
         proof is anchored in one pass; the anonymous budget is untouched."""
         fps, _ = self.seed_pending_proofs(40, "backlog")
@@ -1918,7 +1918,7 @@ class TestCalendarModeConfig(unittest.TestCase):
             self.assertEqual(cal["mode"], "calendar")
             self.assertEqual(cal["calendar_url"], "http://127.0.0.1:14788")
             self.assertIsNone(cal["gateway_url"])
-            # The appliance defaults (ruling 2026-09-11): eight in flight, one
+            # The appliance defaults: eight in flight, one
             # upgrade pass an hour.
             self.assertEqual(cal["inflight"], 8)
             self.assertEqual(cal["upgrade_inflight"], 8)
@@ -1967,8 +1967,7 @@ class TestOtsParser(unittest.TestCase):
         with self.assertRaises(api_endpoint.OtsError):
             api_endpoint.splice_upgrade(upgraded, cal_bitcoin_response(1))
 
-        # The library is the oracle and the suite needs it: no skip
-        # (2026-09-18 cold review R09).
+        # The library is the oracle and the suite needs it: no skip.
         from opentimestamps.core.serialize import StreamDeserializationContext
         from opentimestamps.core.timestamp import DetachedTimestampFile
         from opentimestamps.core.notary import BitcoinBlockHeaderAttestation

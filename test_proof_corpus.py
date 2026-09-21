@@ -2,7 +2,7 @@
 client. proof_corpus.py holds the cases; the library's verdict is
 computed here, never assumed. The library is the oracle and the suite
 needs it: a host without `opentimestamps` fails these tests instead of
-skipping them (2026-09-18 cold review R09: the oracle must run)."""
+skipping them: the oracle must run."""
 import io
 import unittest
 
@@ -96,11 +96,11 @@ class TestCorpusAgainstTheLibrary(unittest.TestCase):
                 self.assertEqual(library_verdict(data)[0], "invalid")
 
     def test_every_attestation_type_the_client_knows_is_read_as_the_client_reads_it(self):
-        """2026-09-18 cold review R09: the Litecoin and Ethereum tags are
-        known to the client and read as one varuint height; the readers
-        here took them for opaque unknown tags, so a payload the client
-        refuses (empty, a trailing byte) parsed, and beside a Bitcoin node
-        made the proof bitcoin_attestation_present. For each of the four
+        """The Litecoin and Ethereum tags are known to the client and read
+        as one varuint height; readers that took them for opaque unknown
+        tags would parse a payload the client refuses (empty, a trailing
+        byte), and beside a Bitcoin node make the proof
+        bitcoin_attestation_present. For each of the four
         tags: a valid payload, an empty one, a trailing byte, an
         unterminated varuint; alone for both readers and inspect_proof,
         beside a Bitcoin node for the tree reader and inspect_proof (the
