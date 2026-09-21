@@ -931,11 +931,6 @@ def decode_invoice(cfg, password, bolt11):
     return sats, None
 
 
-def decode_invoice_sats(cfg, password, bolt11):
-    """None on any failure — never pay an amount that could not be read."""
-    return decode_invoice(cfg, password, bolt11)[0]
-
-
 def wallet_payment_outcome(cfg, password, payment_hash):
     """What the wallet says became of an attempt to pay payment_hash, from
     GET /payments/outgoingbyhash/{hash} (phoenixd 0.8.0 and 0.9.1: the best
@@ -1275,7 +1270,7 @@ def load_sidecar(path):
     when the sidecar itself is rewritten."""
     try:
         st = os.stat(path)
-    except (FileNotFoundError, OSError):
+    except OSError:
         return None, 0.0
     age = max(0.0, time.time() - st.st_mtime)
     try:
