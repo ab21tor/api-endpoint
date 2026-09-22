@@ -2129,7 +2129,24 @@ def make_handler(cfg):
                     self._reply(code, msg)
                 return
             new_debt = False
-            if not proof_on_disk(cfg, fp):
+            if proof_on_disk(cfg, fp):
+                # A proof already on disk answers for the promise only
+                # once its barrier is repeated, under the lock: the pass
+                # that wrote it may have failed at the directory fsync
+                # after the rename, and this door cannot tell. A debt
+                # left beside it by a 500 whose cleanup failed gets its
+                # barrier too. A barrier that fails is no promise.
+                try:
+                    with fp_lock(fp):
+                        fsync_existing(proof_path(cfg, fp))
+                        if os.path.exists(debt_path(cfg, fp)):
+                            fsync_existing(debt_path(cfg, fp))
+                except OSError as exc:
+                    log_event(cfg, "intake_error", fp=fp, reason="proof_sync_failed",
+                              err=type(exc).__name__)
+                    self._reply(500, "cannot confirm the proof; not received")
+                    return
+            else:
                 try:
                     new_debt = write_debt(cfg, fp)
                 except OSError:

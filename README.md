@@ -127,7 +127,11 @@ directory.
   characters. Anything else under that header is a 400.
 - **Reply:** `200 received <fingerprint>`, sent only after the debt is
   durable. A debt that cannot be written gets
-  `500 cannot record the debt; not received`.
+  `500 cannot record the debt; not received`. A fingerprint whose proof
+  is already on disk is acknowledged only after the proof's barrier (its
+  file, then its directory) is repeated under the lock, a debt still
+  beside it getting its own; a barrier that fails gets
+  `500 cannot confirm the proof; not received`.
 - Every other method or path: 405 or 404, naming the one route.
 
 Whatever can reach `LISTEN_ADDR` can submit records and, with

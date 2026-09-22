@@ -979,5 +979,98 @@ class TestIntervalConfig(unittest.TestCase):
         self.assertEqual(cfg["upgrade_secs"], 30.0)
 
 
+class TestVisibleProofIntake(UnitBase):
+    """A1. A proof already on disk answers a repeated POST only once its
+    barrier is repeated under the fingerprint's lock, and a debt left
+    beside it by a 500 whose cleanup failed gets its barrier too; a
+    barrier that fails is `500 cannot confirm the proof; not received`,
+    logged `intake_error reason=proof_sync_failed`, and no debt is
+    written. Fault model: the debt's directory fsync and its cleanup
+    refused on the first POST, the proof's directory fsync refused after
+    the buyer's rename, every barrier refused on the retry; then the
+    barriers holding, against the real files and the real fsync."""
+
+    def intake(self):
+        handler = a.make_handler(self.cfg).__new__(a.make_handler(self.cfg))
+        handler.path = "/record"
+        handler.headers = {"Content-Length": "64", "X-Digest": "sha256"}
+        handler.rfile = io.BytesIO(self.fp.encode())
+        replies = []
+        handler._reply = lambda code, text, extra=None: replies.append((code, text))
+        handler.do_POST()
+        self.assertEqual(len(replies), 1)
+        return replies[0]
+
+    def test_a_visible_proof_beside_a_failed_debt_is_acknowledged_only_once_both_barriers_hold(self):
+        real_sync, real_unlink = a.fsync_dir, os.unlink
+        debt = a.debt_path(self.cfg, self.fp)
+        failures = []
+
+        def debt_sync(path):
+            if path == self.cfg["debts_dir"]:
+                failures.append("debt-directory")
+                raise OSError(errno.EIO, "injected debt directory sync failure")
+            return real_sync(path)
+
+        def unlink(path, *args, **kwargs):
+            if str(path) == debt:
+                failures.append("cleanup")
+                raise PermissionError(errno.EACCES, "injected refused cleanup")
+            return real_unlink(path, *args, **kwargs)
+        with patch.object(a, "fsync_dir", side_effect=debt_sync), patch.object(a.os, "unlink", side_effect=unlink):
+            self.assertEqual(self.intake()[0], 500)
+        self.assertEqual(failures, ["debt-directory", "cleanup"])
+        self.assertTrue(Path(debt).exists(), "the debt file remains behind the 500")
+
+        def proof_sync(path):
+            if path == self.cfg["proofs_dir"]:
+                failures.append("proof-directory")
+                raise OSError(errno.EIO, "injected proof directory sync failure")
+            return real_sync(path)
+        with patch.object(a, "fsync_dir", side_effect=proof_sync):
+            with self.assertRaises(OSError):
+                a.store_proof(self.cfg, self.fp, pending(self.fp))
+        self.assertEqual(failures[-1], "proof-directory")
+        self.assertTrue(self.exists("proof"), "the proof is visible, its durability unknown")
+        # The retry while every barrier still fails: refused, the proof's barrier tried, nothing written.
+        tried = []
+
+        def still_failed(path):
+            tried.append(path)
+            raise OSError(errno.EIO, "directory sync still unavailable")
+        with patch.object(a, "fsync_dir", side_effect=still_failed):
+            code, text = self.intake()
+        self.assertEqual((code, text), (500, "cannot confirm the proof; not received"))
+        self.assertEqual(tried, [self.cfg["proofs_dir"]], "the proof's barrier first, refused")
+        self.assertIn("intake_error fp=%s reason=proof_sync_failed err=OSError" % self.fp, self.log())
+        # The barriers hold: both repeated, the proof's then the debt's, on the real files; then received.
+        synced = []
+
+        def recording(path):
+            synced.append(path)
+            return real_sync(path)
+        with patch.object(a, "fsync_dir", side_effect=recording):
+            code, text = self.intake()
+        self.assertEqual((code, text), (200, "received " + self.fp))
+        self.assertEqual(synced, [self.cfg["proofs_dir"], self.cfg["debts_dir"]])
+        self.assertIn("received fp=%s new_debt=false" % self.fp, self.log())
+
+    def test_a_durable_proof_is_acknowledged_after_its_barrier(self):
+        """Control: a proof the buyer stored, the real fsync, 200 with the barrier run once."""
+        self.assertEqual(self.intake()[0], 200)
+        a.store_proof(self.cfg, self.fp, pending(self.fp))
+        self.assertFalse(self.exists("debt"))
+        real_sync = a.fsync_dir
+        synced = []
+
+        def recording(path):
+            synced.append(path)
+            return real_sync(path)
+        with patch.object(a, "fsync_dir", side_effect=recording):
+            self.assertEqual(self.intake(), (200, "received " + self.fp))
+        self.assertEqual(synced, [self.cfg["proofs_dir"]])
+        self.assertFalse(self.exists("debt"), "no debt is written for a proof that answers")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
