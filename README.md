@@ -76,6 +76,41 @@ Each rule is made by the code and pinned by the tests "Tests" names.
   are not one, are repaired before the door opens ("Recover").
 - The phoenixd password lives only in memory and an Authorization
   header: no subprocesses, so never in argv; never logged.
+- No header leaves the configured hosts: `http_post` and `http_get`
+  never follow a redirect, so `GATEWAY_UPGRADE_TOKEN`, an L402 preimage
+  or the phoenixd password is never sent to a host a redirect named
+  (2026-09-28 Strix pass, 2.04: urllib followed 301, 302, 303, 307 and
+  308 with the header kept). A 3xx from the gateway, the calendar or
+  phoenixd is a refusal naming its code: on a paid redeem it is counted
+  toward `REDEEM_ATTEMPTS_MAX` like a 401 (`redeem_failed … status=302
+  reason=redirect_302`; 2026-09-29 second round: the first round ended
+  the pass and counted nothing, so the preimage was re-redeemed every
+  pass with `attention=0`), anywhere else it is
+  `<upstream>_unreachable err=redirect_<code>` and the pass ends as for
+  any unreachable upstream.
+- No file under `DATA_DIR` is written through a link at its own path:
+  the log append, every marker and debt create, the index flag and the
+  barrier repeats open with `O_NOFOLLOW` and refuse a hard link, checked
+  on the open descriptor. A link at the log drops the event and says so
+  once on stderr; a link at a marker or debt path is `LinkRefused`,
+  logged (`cannot_mark_pending … err=LinkRefused`, `intake_error`) and
+  nothing is stored (2026-09-28 Strix pass, 2.02: a linked `log` was
+  appended to and a dangling symlink at a marker path created its
+  target outside `DATA_DIR`). The rule is scoped to the final path
+  component, which is all `O_NOFOLLOW` covers: a link at `DATA_DIR`
+  itself or at one of its directories (`debts`, `proofs`, `pending`) is
+  followed, since the layout of the directories is the operator's
+  (`test_the_rule_is_scoped_to_the_final_path_component`).
+- Two size caps, `MAX_PROOF_BYTES` and `MAX_UPSTREAM_BODY_BYTES`
+  ("Configuration"), applied at intake: a proof arriving over the first
+  is INVALID with its size in the reason and an upstream body over the
+  second is a refusal naming the cap (counted on a paid redeem, the
+  unreachable class elsewhere); neither ever yields a truncated proof
+  (2026-09-28 Strix pass, 2.05). A proof already stored is read whole,
+  whatever the cap now is: lowering the cap never sets a stored proof
+  aside, re-buys it, skips it in the index or reads it as unfinished
+  (2026-09-29 second round: the first round applied the cap at every
+  read).
 - No client address reaches the log or stderr: per-request logging is
   off, a reply that fails mid-write is logged as `reply_failed` with the
   exception class alone, and the server's error path (which the standard
@@ -132,10 +167,22 @@ directory.
   file, then its directory) is repeated under the lock, a debt still
   beside it getting its own; a barrier that fails gets
   `500 cannot confirm the proof; not received`.
+- **Browsers:** a POST carrying an `Origin` or a `Sec-Fetch-Site`
+  header, whatever their values, is a 403, logged `rejected
+  reason=browser_post`, and writes nothing: a page on any other origin
+  could otherwise auto-submit a `text/plain` form here from a browser
+  that reaches the listener, to which no preflight applies, and have a
+  debt written and budget spent for its bytes (2026-09-28 Strix pass,
+  2.03). There is no same-origin exception: this door serves no page, so
+  no browser request is its own, and an `Origin` equal to the request's
+  `Host` is exactly what DNS rebinding produces (2026-09-29 second round:
+  the first round let it through). A POST with neither header is not a
+  browser's and is received as before.
 - Every other method or path: 405 or 404, naming the one route.
 
 Whatever can reach `LISTEN_ADDR` can submit records and, with
-`GATEWAY_URL`, spend the budget; the address is the door's only guard.
+`GATEWAY_URL`, spend the budget; the address is the door's only guard
+against anything that is not a browser.
 
 ### The filesystem
 
@@ -176,6 +223,8 @@ defaults.
 | `REDEEM_ATTEMPTS_MAX` | 300 | definite refusals of a paid preimage (every pass) before the sidecar is marked needs-attention |
 | `REDEEM_ATTENTION_RETRY_SECS` | 3600 | how often a needs-attention sidecar is retried after that |
 | `LOG_CAP_BYTES` | 16777216 | once `log` reaches this many bytes the next event renames it to `log.1` (replacing any previous `.1`) and starts fresh; 0 never rotates |
+| `MAX_PROOF_BYTES` | 1048576 | a proof arriving longer than this is INVALID, its size in the reason (`proof_invalid … reason=proof_of_N_bytes_over_the_M-byte_cap`), never stored, the debt kept; a proof from one calendar is kilobytes. Applied at intake only: a proof already stored is read whole whatever the cap, so lowering it never sets a stored proof aside or re-buys it; an `/upgrade` answer whose proof would exceed the new cap is refused each pass (`upgrade_failed … reason=proof_of_…`), the pending proof and its marker kept, until the cap is raised |
+| `MAX_UPSTREAM_BODY_BYTES` | 2097152 | an upstream body (gateway, calendar, phoenixd) longer than this is read no further and is a refusal naming the cap, never a truncated proof: on a paid redeem counted toward `REDEEM_ATTEMPTS_MAX` (`redeem_failed … reason=body_over_N_bytes`), elsewhere the unreachable class (`gateway_unreachable err=body_over_N_bytes`); at least `MAX_PROOF_BYTES`, since `/upgrade` carries a proof base64 in JSON |
 
 Every interval (`POLL_SECS`, `UPGRADE_SECS`, `HEARTBEAT_SECS`,
 `L402_EXPIRY_SECS`, `REDEEM_ATTENTION_RETRY_SECS`,
@@ -292,8 +341,19 @@ A paid preimage the gateway keeps refusing (after an L402 secret rotation
 every stored macaroon is a 401) is never dropped and never re-paid:
 settlement outranks expiry. It is retried every pass up to
 `REDEEM_ATTEMPTS_MAX` definite refusals (a 503 is "not now": it ends the
-pass and counts nothing), then the sidecar carries `attempts` and an
-`attention` time, one `redeem_needs_attention` line is logged, the
+pass and counts nothing, and so does a gateway that does not answer at
+all; a 200 whose body is a proof of another digest,
+bytes that are not one whole proof, or not a proof at all is a refusal
+like a 401, logged `proof_wrong_digest`, `proof_invalid` or
+`redeem_failed … body_not_ots` per attempt and counted: 2026-09-28 Strix
+pass, 2.01, those used to count nothing and be re-redeemed every pass
+for ever with `attention=0`; so is a 3xx or a body over
+`MAX_UPSTREAM_BODY_BYTES`, logged `redeem_failed … status=302
+reason=redirect_302` or `… status=200 reason=body_over_N_bytes` per
+attempt: 2026-09-29 second round, the first round had made those an
+unreachable gateway that counted nothing), then the sidecar carries `attempts` and an
+`attention` time, one `redeem_needs_attention` line is logged (with the
+`reason` when a 200 brought one), the
 heartbeat's `attention=N` counts such sidecars, and the retry continues
 once per `REDEEM_ATTENTION_RETRY_SECS` without further log lines. A
 gateway that accepts the token again heals it on the next slow retry; to
@@ -360,7 +420,8 @@ claim kit, or `ots verify`).
 Debts and sidecars carry everything across a death; there is no shutdown
 sequence. Every start, before the door opens, reconciles `DATA_DIR`
 (`reconciled …` in the log, with counts): each proof is deserialised
-whole; a `pending` proof without its marker gets it back
+whole, read whole whatever `MAX_PROOF_BYTES` now is (the cap holds at
+intake, never here); a `pending` proof without its marker gets it back
 (`pending_marker_restored`); a proof with a Bitcoin attestation loses a
 stale marker; bytes that are not one whole proof of their fingerprint
 get their debt re-created first, durably, and are then set aside as
@@ -441,7 +502,15 @@ gateway keeps refusing hitting the ceiling once, never re-paid, and
 healing on the slow retry:
 `test_ceiling_marks_attention_once_and_keeps_the_preimage`,
 `test_at_the_ceiling_the_retry_is_slow_and_a_fixed_gateway_heals_it`,
-`test_503_counts_nothing`. Log rotation:
+`test_503_counts_nothing`; every definite answer that is not our proof
+counted the same way, a 3xx and an over-cap body included:
+`test_a_200_with_a_wrong_digest_counts_toward_the_ceiling`,
+`test_a_3xx_on_a_paid_redeem_counts_toward_the_ceiling`,
+`test_a_200_body_over_the_cap_on_a_paid_redeem_counts_toward_the_ceiling`.
+Every browser POST refused, the same-origin shape included
+(`test_browser_posts_are_refused_same_origin_included`); a stored proof
+read whole whatever the cap
+(`test_the_cap_applies_at_intake_only_a_stored_proof_survives_a_lowered_cap`). Log rotation:
 `test_log_rotates_to_dot1_at_cap_and_replaces_previous`,
 `test_log_cap_zero_never_rotates`,
 `test_log_cap_knob_default_and_validation`.

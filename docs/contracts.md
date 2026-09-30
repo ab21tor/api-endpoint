@@ -69,7 +69,7 @@ proof.
 | | |
 |---|---|
 | Authoritative state | `debts/<fp>` |
-| Preconditions | `Content-Length` present; body non-empty (or `X-Digest: sha256` with 64 hex chars); the fingerprint's lock taken; for a fingerprint whose proof is already on disk, the proof's barrier (its file, then its directory) repeated under the lock, and a debt still beside it its own |
+| Preconditions | `Content-Length` present; body non-empty (or `X-Digest: sha256` with 64 hex chars); no `Origin` header and no `Sec-Fetch-Site` header, whatever their values: a browser's POST is `403`, logged `rejected reason=browser_post`, and writes nothing (2026-09-28 Strix pass, 2.03; the 2026-09-29 second round removed the first round's same-origin exception, which DNS rebinding passed, since this door serves no page and no browser request is its own; `test_browser_posts_are_refused_same_origin_included`); the fingerprint's lock taken; for a fingerprint whose proof is already on disk, the proof's barrier (its file, then its directory) repeated under the lock, and a debt still beside it its own |
 | Side effects | the debt file (`O_EXCL`, fsync, directory fsync), or, for a fingerprint whose proof is on disk, no debt and the repeated barriers; one `received` log line |
 | Acknowledgement point | the reply, after `write_debt` returns, or after the proof's barrier (and any remaining debt's) has returned |
 | Ambiguous outcomes | reply lost after the fsync (the promise stands; the retry is a no-op); crash between `O_EXCL` create and the fsync (an empty or torn debt file may exist: its content is unused, its name is the fact; the next start's reconciliation and the buyer treat it as owed, which is the safe direction); a 500 whose cleanup also failed (a debt file remains, logged `debt_cleanup_failed`; owed like any other; the client's retry fsyncs it with its directory under the lock and is answered as owed only when that barrier holds, else 500 again: 2026-09-18 cold review R02, the retry used to acknowledge the file by its presence alone); a proof visible after the buyer's rename whose directory fsync failed, beside a debt whose barrier and cleanup both failed: a repeated `POST` acknowledges only once both barriers hold, else `500 cannot confirm the proof; not received`, logged `intake_error reason=proof_sync_failed`, and no debt is written; the visible bytes alone never answer |
@@ -96,7 +96,7 @@ proof.
 | Preconditions | the marker exists; the proof parses as pending and linear; the calendar answers 200 for the commitment |
 | Side effects | the spliced bytes, deserialised whole and checked to be a proof of `<fp>` with a Bitcoin attestation node, written atomically over the proof and their directory fsynced, under the lock; then the marker cleared; `bitcoin_attestation_present` logged |
 | Acknowledgement point | the directory fsync after the atomic write's rename: the rename is visibility (2026-09-18 cold review R02; this row used to name the rename) |
-| Ambiguous outcomes | a stop after the write and before the marker clear, or a directory fsync that failed after the rename (`upgrade_failed status=write_failed`, the marker kept): the next pass reads the proof, sees the attestation, fsyncs the file and its directory again under the lock and clears the marker only when that returns, else logs `upgrade_sync_failed` and keeps the marker (R02: the marker used to go on the attestation's presence); a 404: pending, nothing written; an answer that does not splice: `upgrade_needs_attention`, marker kept; a fork-marked proof (never from one calendar): `nonlinear`, marker kept; a marker whose proof is absent: silent while a debt, a sidecar or a buyer mid-way can still write it, else kept and reported `proof_missing` every pass (A4) |
+| Ambiguous outcomes | a stop after the write and before the marker clear, or a directory fsync that failed after the rename (`upgrade_failed status=write_failed`, the marker kept): the next pass reads the proof, sees the attestation, fsyncs the file and its directory again under the lock and clears the marker only when that returns, else logs `upgrade_sync_failed` and keeps the marker (R02: the marker used to go on the attestation's presence); a 404: pending, nothing written; an answer that does not splice: `upgrade_needs_attention`, marker kept; an answer whose proof would exceed `MAX_PROOF_BYTES` (the cap holds at intake; a stored proof it now exceeds is read whole): `upgrade_failed … reason=proof_of_N_bytes_over_the_M-byte_cap` in gateway mode, `calendar_answer_rejected` then `upgrade_needs_attention` in calendar mode, the pending proof and its marker kept every pass until the cap is raised, never set aside; a fork-marked proof (never from one calendar): `nonlinear`, marker kept; a marker whose proof is absent: silent while a debt, a sidecar or a buyer mid-way can still write it, else kept and reported `proof_missing` every pass (A4) |
 | Recovery | the next pass; the next start's reconciliation clears a marker on a finished proof, and its final directory fsyncs are that pass's barrier |
 | Tests | `test_calendar_mode_upgrade_404_stays_pending_then_anchored_bytes_spliced`, `test_upgrade_replaces_only_on_anchored_and_then_stops`, `test_review_fixes.TestCompletion`, `TestResumedBarriers` |
 
@@ -106,7 +106,7 @@ proof.
 |---|---|
 | Authoritative state | the proofs; the debts; the markers |
 | Preconditions | before the door, the buyer and the upgrader start |
-| Side effects, per proof | parses whole with a Bitcoin attestation: a stale marker is cleared; pending: a missing marker is restored; anything else: **the debt is written and fsynced first, then the bytes are moved aside** as `<fp>.ots.invalid-<time>`, then the marker cleared (2026-09-15 review F01). Per aside file with neither proof nor debt: the debt is recreated (`aside_requeued`). Per marker with neither proof, debt nor sidecar: **kept and reported** (`proof_missing`, counted as `proofs_missing` in `reconciled`): the marker is the last sign of a promise whose proof is gone, an external deletion or an incomplete restore; no debt is written for it, since a proof bought now would carry a later bound and is not the one promised, and only a copy of the original put back as `proofs/<fp>.ots` resolves it, after which the upgrader resumes from the marker (2026-09-21 year-of-operation review, scenario 18: the marker used to be dropped here and by the upgrader, and the promise vanished without a trace). |
+| Side effects, per proof | read whole whatever `MAX_PROOF_BYTES` now is (the cap is an intake rule; 2026-09-29 second round: the first round applied it here, so a cap lowered below a stored proof's size set the proof aside and re-created its debt; `test_review_fixes.TestSizeCaps.test_the_cap_applies_at_intake_only_a_stored_proof_survives_a_lowered_cap`); parses whole with a Bitcoin attestation: a stale marker is cleared; pending: a missing marker is restored; anything else: **the debt is written and fsynced first, then the bytes are moved aside** as `<fp>.ots.invalid-<time>`, then the marker cleared (2026-09-15 review F01). Per aside file with neither proof nor debt: the debt is recreated (`aside_requeued`). Per marker with neither proof, debt nor sidecar: **kept and reported** (`proof_missing`, counted as `proofs_missing` in `reconciled`): the marker is the last sign of a promise whose proof is gone, an external deletion or an incomplete restore; no debt is written for it, since a proof bought now would carry a later bound and is not the one promised, and only a copy of the original put back as `proofs/<fp>.ots` resolves it, after which the upgrader resumes from the marker (2026-09-21 year-of-operation review, scenario 18: the marker used to be dropped here and by the upgrader, and the promise vanished without a trace). |
 | Acknowledgement point | `reconciled` in the log, then `startup` |
 | Ambiguous outcomes | a stop after the debt write and before the move: the invalid proof is found again next start and moved beside the existing debt; a failed debt write: the start fails (exit 2) with the proof still in place, so the next start repeats the repair; a pending index that cannot be listed: the start fails (exit 2, `cannot reconcile DATA_DIR`) rather than treating the index as empty (2026-09-18 cold review R16); a parser exception on any bytes: the bytes are INVALID, never a crash (2026-09-15 review F13) |
 | Recovery | re-run: every step is idempotent; a missing promised proof is reported at every start until a copy of the original is back, never resolved by the adapter itself |
@@ -139,7 +139,22 @@ Findings F04, F15, F16 of the 2026-09-15/16 review are theirs.
 shape one calendar emits, with the commitment and the splice point for
 an upgrade) and `proof_attestations` (any proof, forks included, listing
 its attestation nodes). Both make only claim (1) below; `inspect_proof`
-adds (2); nothing here makes (3).
+adds (2); nothing here makes (3). Before either reads a byte of a proof
+that arrives, the size: a proof longer than `MAX_PROOF_BYTES` (1 MiB by
+default) is refused with its size in the reason, so it is INVALID
+wherever bytes from upstream are decided on (the buyer's 200s, an
+`/upgrade` answer, the calendar's answers and the upgrade spliced from
+one), and the body it arrived in was already bounded by
+`MAX_UPSTREAM_BODY_BYTES` at the transport (`http_post`, `http_get`: one
+byte over the cap is a `Refused` naming it, never a body cut to fit;
+counted on a paid redeem, the unreachable class elsewhere). The cap is
+an intake rule and nothing else: a proof already stored is read whole
+(`UNCAPPED`) by the door, the index, the upgrader and the reconciliation,
+so a cap lowered later never sets a stored proof aside, re-buys it or
+reads it as unfinished (2026-09-29 second round). 2026-09-28 Strix pass,
+2.05: a syntactically valid 10 MB proof of forked unknown attestations
+and one pending one was stored and re-polled
+(`test_review_fixes.TestSizeCaps`).
 
 1. **Parses**: one whole detached proof by the rules of the public
    client pinned in the tests (`opentimestamps` 0.4.x): every byte

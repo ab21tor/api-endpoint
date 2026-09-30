@@ -19,6 +19,7 @@ money rules: README.md.
 
 import base64
 import collections
+import errno
 import http.client
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
 from concurrent.futures import wait as wait_futures
@@ -26,6 +27,7 @@ import json
 import math
 import os
 import re
+import stat
 import sys
 import tempfile
 import threading
@@ -87,6 +89,24 @@ MAX_URI = 1000                  # PendingAttestation.MAX_URI_LENGTH
 URI_CHARS = frozenset(b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._/:")
 MAX_OPS_ON_A_PATH = 255         # Timestamp.deserialize's recursion limit (256 levels)
 MAX_VARUINT_BYTES = 10
+# Two caps of this adapter's own, both configurable (MAX_PROOF_BYTES,
+# MAX_UPSTREAM_BODY_BYTES): a proof longer than the first is INVALID with
+# its size in the reason, an upstream body longer than the second is a
+# Refused naming the cap, and neither ever yields a truncated proof.
+# A proof from one calendar is a few hundred bytes pending and a few
+# kilobytes anchored; an /upgrade answer carries it base64 in JSON. Without
+# them a syntactically valid proof of any size was stored and re-polled
+# (2026-09-28 Strix pass, 2.05: 10 MB of forked unknown attestations).
+# Both are intake rules: they bound what arrives from upstream and what is
+# about to be written. A proof already stored is read whole (UNCAPPED),
+# whatever the cap now is: it was capped when it arrived, and a cap
+# lowered later never sets it aside, re-buys it, skips it in the index or
+# reads it as unfinished (2026-09-29 second round: the first round applied
+# the cap at every read, and the next start's reconciliation set a stored
+# proof aside and re-created its debt).
+MAX_PROOF_BYTES_DEFAULT = 1024 * 1024
+MAX_UPSTREAM_BODY_BYTES_DEFAULT = 2 * 1024 * 1024
+UNCAPPED = math.inf     # max_bytes for bytes already stored: read whole
 
 Proof = collections.namedtuple("Proof", "digest commitment attestation ops_end")
 
@@ -185,13 +205,22 @@ def _apply_op(tag, msg, data, pos):
     return new, pos
 
 
-def parse_ots(data):
+def _within_proof_cap(data, max_bytes):
+    """max_bytes: the configured cap for bytes arriving from upstream
+    (None: the default), UNCAPPED for a proof already stored."""
+    cap = MAX_PROOF_BYTES_DEFAULT if max_bytes is None else max_bytes
+    if len(data) > cap:
+        raise OtsError("proof of %d bytes over the %d-byte cap" % (len(data), cap))
+
+
+def parse_ots(data, max_bytes=None):
     """Read a linear detached proof: header, sha256 op, 32-byte digest, a
     chain of sha256/append/prepend ops, one attestation. Returns Proof with
     the message the attestation is about (the commitment) and the offset
     of the attestation marker (the splice point for an upgrade). Anything
     else — a fork marker, an op the calendar never emits, trailing bytes —
     is refused rather than guessed at."""
+    _within_proof_cap(data, max_bytes)
     if data[:len(OTS_MAGIC)] != OTS_MAGIC:
         raise OtsError("not an OpenTimestamps proof (bad magic)")
     pos = len(OTS_MAGIC)
@@ -225,27 +254,28 @@ def parse_ots(data):
             raise OtsError("more than %d operations on one path" % MAX_OPS_ON_A_PATH)
 
 
-def build_ots(digest, calendar_response):
+def build_ots(digest, calendar_response, max_bytes=None):
     """The calendar's answer to a digest POST is the serialized timestamp of
     that digest; prefixing the detached-file header makes it a .ots file,
     byte-for-byte what the ots client writes for a single calendar."""
     ots = OTS_MAGIC + varuint(OTS_VERSION) + bytes([OP_SHA256]) + digest + calendar_response
-    proof = parse_ots(ots)
+    proof = parse_ots(ots, max_bytes)
     if proof.digest != digest:
         raise OtsError("digest mismatch while building the proof")
     return ots
 
 
-def splice_upgrade(ots, calendar_response):
+def splice_upgrade(ots, calendar_response, max_bytes=None):
     """Replace a pending attestation with the calendar's timestamp of the
     commitment (its path up the anchor tree ending in a Bitcoin
     attestation). Refused unless the result is a complete, linear proof of
-    the same digest."""
-    proof = parse_ots(ots)
+    the same digest. ots is the stored proof, read whole; max_bytes caps
+    the result, the bytes about to be written."""
+    proof = parse_ots(ots, UNCAPPED)
     if proof.attestation[0] != "pending":
         raise OtsError("proof is not pending")
     upgraded = ots[:proof.ops_end] + calendar_response
-    new = parse_ots(upgraded)
+    new = parse_ots(upgraded, max_bytes)
     if new.attestation[0] != "bitcoin":
         raise OtsError("upgrade response carries no Bitcoin attestation")
     if new.digest != proof.digest:
@@ -262,7 +292,7 @@ PENDING = "pending"                                           # only pending att
 INVALID = "invalid"                                           # not a whole proof, or not of this fingerprint
 
 
-def proof_attestations(data):
+def proof_attestations(data, max_bytes=None):
     """Every attestation node of a detached proof, forks included (a proof
     the gateway upgraded keeps its pending attestation beside the Bitcoin
     path), once the whole file has been walked: (digest hex, [(kind,
@@ -278,6 +308,7 @@ def proof_attestations(data):
     so `pending` holds, per open fork, the message length and operation
     count the sibling branch resumes with; an attestation ends a branch,
     and the whole proof when no fork is open."""
+    _within_proof_cap(data, max_bytes)
     if data[:len(OTS_MAGIC)] != OTS_MAGIC:
         raise OtsError("not an OpenTimestamps proof (bad magic)")
     pos = len(OTS_MAGIC)
@@ -332,7 +363,7 @@ def proof_attestations(data):
     return digest.hex(), out
 
 
-def inspect_proof(data, fp=None):
+def inspect_proof(data, fp=None, max_bytes=None):
     """(state, reason) for proof bytes, after a complete deserialisation:
     BITCOIN_ATTESTATION_PRESENT when an attestation node is a Bitcoin
     block-header attestation; PENDING when the only attestations are
@@ -340,7 +371,7 @@ def inspect_proof(data, fp=None):
     one whole proof, a proof of another digest when fp is given, no usable
     attestation). Structural states only; see BITCOIN_ATTESTATION_PRESENT."""
     try:
-        digest, attestations = proof_attestations(data)
+        digest, attestations = proof_attestations(data, max_bytes)
     except OtsError as exc:
         return INVALID, str(exc).replace(" ", "_")
     if fp is not None and digest != fp:
@@ -353,11 +384,11 @@ def inspect_proof(data, fp=None):
     return INVALID, "no_usable_attestation"
 
 
-def bitcoin_attestation_present(data):
+def bitcoin_attestation_present(data, max_bytes=None):
     """True when the bytes are one whole proof with a Bitcoin block-header
     attestation node. A structural fact about the file, not a verification
     against Bitcoin."""
-    return inspect_proof(data)[0] == BITCOIN_ATTESTATION_PRESENT
+    return inspect_proof(data, max_bytes=max_bytes)[0] == BITCOIN_ATTESTATION_PRESENT
 
 # An X-Digest: sha256 body is 64 hex chars plus whatever whitespace a shell
 # pipeline appends; anything bigger than this is not a digest.
@@ -371,6 +402,24 @@ class ConfigError(Exception):
 
 class Unreachable(Exception):
     """Transport-level failure: refused, timeout, DNS. Not an HTTP status."""
+
+
+class Refused(Unreachable):
+    """A definite answer from the configured host that this adapter will
+    not take: a 3xx (no redirect is followed) or a body over
+    MAX_UPSTREAM_BODY_BYTES. To every caller that does not distinguish it
+    is the Unreachable it always was (nothing usable arrived; the upstream
+    is marked down, named `redirect_<code>` or `body_over_<cap>_bytes`).
+    To a paid redeem it is a refusal like a 401: the gateway answered, so
+    it is not down, and the answer is counted toward REDEEM_ATTEMPTS_MAX
+    (2026-09-29 second round: the first round's Unreachable counted
+    nothing, and the preimage was re-redeemed every pass for ever with
+    attention=0, where HEAD had counted the same 302)."""
+
+    def __init__(self, status, reason):
+        super().__init__(reason)
+        self.status = status
+        self.reason = reason
 
 
 class LedgerCorrupt(Exception):
@@ -481,6 +530,13 @@ def resolve_config(environ, script_dir=SCRIPT_DIR):
         return int(raw)
 
     data_dir = get("DATA_DIR", script_dir)
+    max_proof_bytes = pint("MAX_PROOF_BYTES", str(MAX_PROOF_BYTES_DEFAULT))
+    max_upstream_body_bytes = pint("MAX_UPSTREAM_BODY_BYTES", str(MAX_UPSTREAM_BODY_BYTES_DEFAULT))
+    if max_upstream_body_bytes < max_proof_bytes:
+        raise ConfigError(
+            f"MAX_UPSTREAM_BODY_BYTES ({max_upstream_body_bytes}) must be at least MAX_PROOF_BYTES "
+            f"({max_proof_bytes}): a proof arrives inside an upstream body (base64 in JSON on /upgrade)"
+        )
     return {
         "listen_host": host,
         "listen_port": int(port_s),
@@ -512,6 +568,11 @@ def resolve_config(environ, script_dir=SCRIPT_DIR):
         # throttle for this client (its UPGRADE_CLIENT_TOKEN). Unset = anonymous.
         "gateway_upgrade_token": get("GATEWAY_UPGRADE_TOKEN") or None,
         "log_cap_bytes": uint("LOG_CAP_BYTES", str(16 * 1024 * 1024)),
+        # A proof longer than the first is INVALID (its size in the reason);
+        # an upstream body longer than the second is an Unreachable naming
+        # the cap. Neither ever yields a truncated proof.
+        "max_proof_bytes": max_proof_bytes,
+        "max_upstream_body_bytes": max_upstream_body_bytes,
         "data_dir": data_dir,
         "debts_dir": os.path.join(data_dir, "debts"),
         "proofs_dir": os.path.join(data_dir, "proofs"),
@@ -544,25 +605,69 @@ def read_phoenix_password(path):
 _LOG_LOCK = threading.Lock()
 
 
+class LinkRefused(OSError):
+    """A path this adapter writes (the log, a marker, a debt, the index
+    flag) that is a symbolic or hard link. Never written through: with
+    write access under DATA_DIR a local actor could otherwise point such a
+    name at any file the service account can write (2026-09-28 Strix
+    pass, 2.02: a linked `log` was appended to, a dangling symlink at a
+    marker path created its target outside DATA_DIR)."""
+
+
+def _open_regular(path, flags, mode=0o600):
+    """os.open that never follows a symbolic link at the path (O_NOFOLLOW)
+    and refuses a hard link: the descriptor returned names a regular file
+    with one name, checked on the descriptor itself. LinkRefused, an
+    OSError, otherwise."""
+    try:
+        fd = os.open(path, flags | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0), mode)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            raise LinkRefused(exc.errno, "symbolic link refused", path)
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1:
+            raise LinkRefused(errno.ELOOP, "link refused: not a regular file with one name", path)
+    except BaseException:
+        os.close(fd)
+        raise
+    return fd
+
+
+_LOG_REFUSED = set()   # log paths found to be links, each said once to stderr
+
+
 def log_event(cfg, event, **kv):
     """One fixed-format line: '<utc> <event> k=v ...'. Never record bytes,
     never secrets, never gateway or phoenixd URLs.
 
     Rotation: once the log has reached LOG_CAP_BYTES, the next event renames
     it to `log.1` (replacing any previous `.1`) and starts a fresh `log`; one
-    generation is kept. 0 disables rotation."""
+    generation is kept. 0 disables rotation. The append opens the log
+    without following a link and refuses a hard link (LinkRefused): the
+    event is then dropped and the refusal said once, to stderr, since the
+    log is what is refused."""
     parts = [utc_now_iso(), event] + [f"{k}={v}" for k, v in kv.items()]
     with _LOG_LOCK:
         try:
             cap = cfg.get("log_cap_bytes", 0)
             if cap:
                 try:
-                    if os.path.getsize(cfg["log_path"]) >= cap:
+                    if os.lstat(cfg["log_path"]).st_size >= cap:
                         os.replace(cfg["log_path"], cfg["log_path"] + ".1")
                 except FileNotFoundError:
                     pass
-            with open(cfg["log_path"], "a", encoding="utf-8") as f:
-                f.write(" ".join(parts) + "\n")
+            fd = _open_regular(cfg["log_path"], os.O_WRONLY | os.O_APPEND | os.O_CREAT)
+            try:
+                write_all(fd, (" ".join(parts) + "\n").encode("utf-8"))
+            finally:
+                os.close(fd)
+        except LinkRefused:
+            if cfg["log_path"] not in _LOG_REFUSED:
+                _LOG_REFUSED.add(cfg["log_path"])
+                print(f"api-endpoint: the log at {cfg['log_path']} is a link; not written through",
+                      file=sys.stderr, flush=True)
         except OSError:
             pass  # a failing log must never take down intake or buying
 
@@ -587,8 +692,8 @@ def fsync_existing(path):
     debt behind the proof, clears the marker behind the upgrade) repeats
     the barrier first, under the fingerprint's lock, and does not act if
     the barrier fails again; the file's presence is never taken for the
-    barrier having held. Raises OSError."""
-    fd = os.open(path, os.O_RDONLY)
+    barrier having held. Raises OSError (LinkRefused for a link)."""
+    fd = _open_regular(path, os.O_RDONLY)
     try:
         os.fsync(fd)
     finally:
@@ -749,45 +854,70 @@ class StateChange:
 
 
 # HTTP plumbing (urllib only; no curl, no argv, no new dependencies)
-def http_post(url, body, headers, timeout):
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """urllib follows 301/302/303 (a POST becoming a GET) and 307/308 and
+    keeps every header, so a redirecting upstream received the bearer
+    token, the L402 preimage or the phoenixd password at a host of its
+    choosing (2026-09-28 Strix pass, 2.04). No redirect is followed: the
+    3xx is a Refused naming its code, the caller names the upstream
+    (`gateway_unreachable err=redirect_302`, or the counted
+    `redeem_failed … reason=redirect_302` on a paid redeem), and nothing
+    is ever sent anywhere but the configured URL."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirects)
+
+
+def _read_body(resp, max_bytes, status):
+    """At most the cap, whole: one byte more is a Refused naming the cap
+    and the status it came with, never a body cut to fit."""
+    cap = MAX_UPSTREAM_BODY_BYTES_DEFAULT if max_bytes is None else max_bytes
+    body = resp.read(cap + 1)
+    if len(body) > cap:
+        raise Refused(status, "body_over_%d_bytes" % cap)
+    return body
+
+
+def _request(req, timeout, max_bytes):
+    try:
+        with _OPENER.open(req, timeout=timeout) as resp:
+            return resp.status, resp.headers, _read_body(resp, max_bytes, resp.status)
+    except urllib.error.HTTPError as e:
+        if 300 <= e.code < 400:
+            raise Refused(e.code, "redirect_%d" % e.code)
+        try:
+            resp_body = _read_body(e, max_bytes, e.code)
+        except OSError:
+            resp_body = b""
+        return e.code, e.headers if e.headers is not None else {}, resp_body
+    except (OSError, http.client.HTTPException) as e:
+        raise Unreachable(type(e).__name__)
+
+
+def http_post(url, body, headers, timeout, max_bytes=None):
     """POST returning (status, headers, body_bytes). 4xx/5xx are returned,
-    not raised; only transport failures raise Unreachable."""
-    req = urllib.request.Request(url, data=body, headers=dict(headers),
-                                 method="POST")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.headers, resp.read()
-    except urllib.error.HTTPError as e:
-        try:
-            resp_body = e.read()
-        except OSError:
-            resp_body = b""
-        return e.code, e.headers if e.headers is not None else {}, resp_body
-    except (OSError, http.client.HTTPException) as e:
-        raise Unreachable(type(e).__name__)
+    not raised; a 3xx and a body over max_bytes (MAX_UPSTREAM_BODY_BYTES)
+    raise Refused, transport failures Unreachable, each naming which."""
+    return _request(urllib.request.Request(url, data=body, headers=dict(headers), method="POST"),
+                    timeout, max_bytes)
 
 
-def http_get(url, timeout, headers=None):
+def http_get(url, timeout, headers=None, max_bytes=None):
     """GET returning (status, headers, body_bytes); 4xx/5xx are returned,
-    not raised; only transport failures raise Unreachable."""
-    req = urllib.request.Request(url, headers=dict(headers or {}), method="GET")
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return resp.status, resp.headers, resp.read()
-    except urllib.error.HTTPError as e:
-        try:
-            resp_body = e.read()
-        except OSError:
-            resp_body = b""
-        return e.code, e.headers if e.headers is not None else {}, resp_body
-    except (OSError, http.client.HTTPException) as e:
-        raise Unreachable(type(e).__name__)
+    not raised; a 3xx and a body over max_bytes raise Refused, transport
+    failures Unreachable, each naming which."""
+    return _request(urllib.request.Request(url, headers=dict(headers or {}), method="GET"),
+                    timeout, max_bytes)
 
 
 def gateway_challenge(cfg, fp):
     return http_post(cfg["gateway_url"] + "/timestamp",
                      json.dumps({"digest": fp}).encode(),
-                     {"Content-Type": "application/json"}, timeout=60)
+                     {"Content-Type": "application/json"}, timeout=60,
+                     max_bytes=cfg["max_upstream_body_bytes"])
 
 
 def gateway_redeem(cfg, fp, macaroon, preimage):
@@ -796,7 +926,7 @@ def gateway_redeem(cfg, fp, macaroon, preimage):
                      json.dumps({"digest": fp}).encode(),
                      {"Content-Type": "application/json",
                       "Authorization": f"L402 {macaroon}:{preimage}"},
-                     timeout=120)
+                     timeout=120, max_bytes=cfg["max_upstream_body_bytes"])
 
 
 def gateway_upgrade(cfg, fp, ots_bytes):
@@ -806,7 +936,7 @@ def gateway_upgrade(cfg, fp, ots_bytes):
     if cfg.get("gateway_upgrade_token"):
         headers["Authorization"] = "Bearer " + cfg["gateway_upgrade_token"]
     return http_post(cfg["gateway_url"] + "/upgrade", body.encode(), headers,
-                     timeout=60)
+                     timeout=60, max_bytes=cfg["max_upstream_body_bytes"])
 
 
 # The appliance shape: the calendar protocol (opentimestamps-server fork,
@@ -829,12 +959,12 @@ def calendar_submit(cfg, fp):
     digest = bytes.fromhex(fp)
     status, headers, body = http_post(cfg["calendar_url"] + "/digest", digest,
                                       {"Content-Type": "application/octet-stream"},
-                                      timeout=60)
+                                      timeout=60, max_bytes=cfg["max_upstream_body_bytes"])
     if status != 200:
         return status, headers, body
     try:
-        ots = build_ots(digest, body)
-        if parse_ots(ots).attestation[0] != "pending":
+        ots = build_ots(digest, body, cfg["max_proof_bytes"])
+        if parse_ots(ots, cfg["max_proof_bytes"]).attestation[0] != "pending":
             raise OtsError("answer carries no pending attestation")
     except OtsError as exc:
         log_event(cfg, "calendar_answer_rejected", fp=fp,
@@ -858,7 +988,7 @@ def calendar_upgrade(cfg, fp, ots_bytes):
         return 200, {}, json.dumps(obj).encode()
 
     try:
-        proof = parse_ots(ots_bytes)
+        proof = parse_ots(ots_bytes, UNCAPPED)   # the stored proof: its shape decides, not its size
     except OtsError as exc:
         return answer({"status": "nonlinear" if "fork" in str(exc) else "invalid",
                        "bitcoin_anchored": False, "ots": None})
@@ -869,14 +999,15 @@ def calendar_upgrade(cfg, fp, ots_bytes):
         return answer({"status": "no_attestations", "bitcoin_anchored": False,
                        "ots": None})
     status, headers, body = http_get(
-        cfg["calendar_url"] + "/timestamp/" + proof.commitment.hex(), timeout=60)
+        cfg["calendar_url"] + "/timestamp/" + proof.commitment.hex(), timeout=60,
+        max_bytes=cfg["max_upstream_body_bytes"])
     if status == 404:
         return answer({"status": "pending", "bitcoin_anchored": False,
                        "ots": base64.b64encode(ots_bytes).decode("ascii")})
     if status != 200:
         return status, headers, body
     try:
-        upgraded = splice_upgrade(ots_bytes, body)
+        upgraded = splice_upgrade(ots_bytes, body, cfg["max_proof_bytes"])
     except OtsError as exc:
         log_event(cfg, "calendar_answer_rejected", fp=fp,
                   reason=str(exc).replace(" ", "_"))
@@ -909,7 +1040,7 @@ def phoenixd_call(cfg, password, endpoint, bolt11, timeout):
         urllib.parse.urlencode({"invoice": bolt11}).encode(),
         {"Content-Type": "application/x-www-form-urlencoded",
          "Authorization": "Basic " + tok},
-        timeout,
+        timeout, max_bytes=cfg["max_upstream_body_bytes"],
     )
     if status != 200:
         return None
@@ -944,7 +1075,8 @@ def wallet_payment_outcome(cfg, password, payment_hash):
                           neither. Transport failures raise Unreachable."""
     tok = base64.b64encode(b":" + password.encode()).decode("ascii")
     status, _, body = http_get(cfg["phoenixd_url"] + "/payments/outgoingbyhash/" + payment_hash,
-                               timeout=20, headers={"Authorization": "Basic " + tok})
+                               timeout=20, headers={"Authorization": "Basic " + tok},
+                               max_bytes=cfg["max_upstream_body_bytes"])
     if status == 204:
         return "failed", None
     if status != 200:
@@ -1013,7 +1145,7 @@ def write_debt(cfg, fp):
     path = debt_path(cfg, fp)
     with fp_lock(fp):
         try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            fd = _open_regular(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
         except FileExistsError:
             fsync_existing(path)
             return False
@@ -1072,9 +1204,9 @@ def pending_path(cfg, fp):
 def pending_mark(cfg, fp):
     """Create the marker and fsync its directory. Raises OSError: a marker
     that is not on disk means a proof nothing would ever upgrade, so the
-    caller must not store the proof (store_proof)."""
-    fd = os.open(pending_path(cfg, fp), os.O_WRONLY | os.O_CREAT, 0o600)
-    os.close(fd)
+    caller must not store the proof (store_proof); a link at the marker's
+    path is LinkRefused, never followed."""
+    os.close(_open_regular(pending_path(cfg, fp), os.O_WRONLY | os.O_CREAT))
     fsync_dir(cfg["pending_dir"])
 
 
@@ -1104,7 +1236,7 @@ def proof_on_disk(cfg, fp):
             data = f.read()
     except OSError:
         return False
-    return inspect_proof(data, fp)[0] != INVALID
+    return inspect_proof(data, fp, UNCAPPED)[0] != INVALID
 
 
 def _report_missing_proof(cfg, fp):
@@ -1164,16 +1296,14 @@ def build_pending_index(cfg):
                 data = f.read()
         except OSError:
             continue
-        if inspect_proof(data, fp)[0] == PENDING:
+        if inspect_proof(data, fp, UNCAPPED)[0] == PENDING:
             try:
                 pending_mark(cfg, fp)
             except OSError as exc:
                 log_event(cfg, "cannot_mark_pending", fp=fp, err=type(exc).__name__)
                 continue
             pending += 1
-    fd = os.open(os.path.join(cfg["pending_dir"], PENDING_BUILT),
-                 os.O_WRONLY | os.O_CREAT, 0o600)
-    os.close(fd)
+    os.close(_open_regular(os.path.join(cfg["pending_dir"], PENDING_BUILT), os.O_WRONLY | os.O_CREAT))
     fsync_dir(cfg["pending_dir"])
     return pending, scanned
 
@@ -1183,7 +1313,9 @@ def reconcile_state(cfg):
     pending index are made to agree, so an installation stranded by an
     earlier release (the marker race, a header-only "proof", .built or
     not) is repaired. Each proof is deserialised
-    whole: a PENDING proof without a marker gets one back
+    whole and read whole, whatever MAX_PROOF_BYTES now is (the cap is an
+    intake rule; a stored proof was capped when it arrived): a PENDING
+    proof without a marker gets one back
     (`pending_marker_restored`); a proof with a Bitcoin attestation loses a
     stale marker; INVALID bytes get their debt re-created first and are
     then set aside as <fp>.ots.invalid-<time>, so the buyer fetches a
@@ -1212,7 +1344,7 @@ def reconcile_state(cfg):
         except OSError:
             counts["unreadable"] += 1
             continue
-        state, reason = inspect_proof(data, fp)
+        state, reason = inspect_proof(data, fp, UNCAPPED)
         marked = os.path.exists(pending_path(cfg, fp))
         if state == BITCOIN_ATTESTATION_PRESENT:
             if marked:
@@ -1255,8 +1387,7 @@ def reconcile_state(cfg):
             counts["proofs_missing"] += 1
     fsync_dir(cfg["pending_dir"])
     fsync_dir(cfg["proofs_dir"])
-    fd = os.open(os.path.join(cfg["pending_dir"], PENDING_BUILT), os.O_WRONLY | os.O_CREAT, 0o600)
-    os.close(fd)
+    os.close(_open_regular(os.path.join(cfg["pending_dir"], PENDING_BUILT), os.O_WRONLY | os.O_CREAT))
     fsync_dir(cfg["pending_dir"])
     if first_index:
         # A data directory from before the index: this was its one scan.
@@ -1344,10 +1475,15 @@ def _breaker_settled(cfg, br):
     br["until"] = 0.0
 
 
-def _mark_down(cfg, flags, which):
+def _mark_down(cfg, flags, which, exc=None):
+    """The upstream (gateway, phoenixd, upgrade_gateway) is marked down,
+    logged on the transition with why: the exception class for a transport
+    failure, `redirect_<code>` for a 3xx, `body_over_<cap>_bytes` for an
+    oversized body (the last two are Refused: on a paid redeem they are
+    counted instead, never routed here)."""
     changed, _ = flags[which].transition("down")
     if changed:
-        log_event(cfg, which + "_unreachable")
+        log_event(cfg, which + "_unreachable", **({"err": str(exc)} if exc is not None and str(exc) else {}))
     return False
 
 
@@ -1357,28 +1493,75 @@ def _mark_up(cfg, flags, which):
         log_event(cfg, which + "_recovered")
 
 
+def _count_refusal(cfg, fp, macaroon, preimage, sidecar, status, reason=None):
+    """A definite refusal of a paid preimage: a 4xx or 5xx that is not
+    503, a 200 whose body is not a proof of this fingerprint (a proof
+    of another digest, bytes that are not one whole proof, not a proof at
+    all: 2026-09-28 Strix pass, 2.01, those returned before this
+    accounting, so the sidecar never reached needs-attention, the
+    heartbeat said attention=0 and the preimage was re-redeemed every
+    pass for ever), a 3xx or a body over the cap (Refused; the 2026-09-29
+    second round). Counted on the sidecar (the redeem right after the
+    payment has none yet and counts nothing); at REDEEM_ATTEMPTS_MAX the
+    sidecar is marked and `redeem_needs_attention` logged once, with the
+    reason when the 200 case brought one; below the ceiling a refusal
+    with no line of its own is logged `redeem_failed`. Returns True: the
+    pass goes on."""
+    attempts = (sidecar or {}).get("attempts", 0)
+    attempts = attempts + 1 if isinstance(attempts, int) else 1
+    attention = (sidecar or {}).get("attention") if sidecar else None
+    if attention is None and attempts >= cfg["redeem_attempts_max"]:
+        attention = utc_now_iso()
+        log_event(cfg, "redeem_needs_attention", fp=fp, status=status, attempts=attempts,
+                  **({"reason": reason} if reason else {}),
+                  note="paid_preimage_kept_retry_every_%ds" % cfg["redeem_attention_retry_secs"])
+    elif attention is None and reason is None:
+        log_event(cfg, "redeem_failed", fp=fp, status=status, note="paid_but_unredeemed")
+    if sidecar is not None:
+        try:
+            write_sidecar(sidecar_path(cfg, fp), macaroon, sidecar.get("invoice", ""),
+                          preimage, attempts=attempts, attention=attention,
+                          payment_hash=sidecar.get("payment_hash"), amount_sats=sidecar.get("amount_sats"))
+        except OSError:
+            log_event(cfg, "cannot_write_sidecar", fp=fp)
+    return True
+
+
 def _redeem(cfg, fp, macaroon, preimage, amt, flags, sidecar=None):
     """sidecar is the stored in-flight record when this is a retry of a paid
-    preimage; a definite refusal is counted on it (J9)."""
+    preimage; a definite refusal is counted on it (J9): a 4xx or 5xx that
+    is not 503, a 200 that is not a proof of this fingerprint, a 3xx, a
+    body over the cap. Only an upstream that did not answer (Unreachable)
+    counts nothing."""
     try:
         status, headers, body = gateway_redeem(cfg, fp, macaroon, preimage)
-    except Unreachable:
-        return _mark_down(cfg, flags, "gateway")
+    except Refused as exc:
+        # A 3xx, or a body over the cap: the configured host answered, so
+        # it is not down, and a paid preimage it answers that way is
+        # refused as a 401 is, counted on the sidecar (2026-09-29 second
+        # round; the first round marked the gateway down and counted
+        # nothing, where HEAD had counted the same 302).
+        _mark_up(cfg, flags, "gateway")
+        log_event(cfg, "redeem_failed", fp=fp, status=exc.status, reason=exc.reason,
+                  note="paid_but_unredeemed")
+        return _count_refusal(cfg, fp, macaroon, preimage, sidecar, exc.status, exc.reason)
+    except Unreachable as exc:
+        return _mark_down(cfg, flags, "gateway", exc)
     _mark_up(cfg, flags, "gateway")
     if status == 200:
         if looks_like_ots(body):
-            state, reason = inspect_proof(body, fp)
+            state, reason = inspect_proof(body, fp, cfg["max_proof_bytes"])
             if state == INVALID and reason == "digest":
                 # A proof of somebody else's digest is not ours to store: the
                 # sidecar keeps the preimage and the next pass asks again.
                 log_event(cfg, "proof_wrong_digest", fp=fp, note="paid",
                           got=(proof_digest(body) or "none")[:12])
-                return True
+                return _count_refusal(cfg, fp, macaroon, preimage, sidecar, status, "wrong_digest")
             if state == INVALID:
                 # Bytes that are not one whole proof: never stored, the
                 # sidecar keeps the preimage and the next pass asks again.
                 log_event(cfg, "proof_invalid", fp=fp, note="paid", reason=reason)
-                return True
+                return _count_refusal(cfg, fp, macaroon, preimage, sidecar, status, reason)
             if not store_proof(cfg, fp, body):
                 return True
             flags["attention"].discard(fp)
@@ -1387,7 +1570,7 @@ def _redeem(cfg, fp, macaroon, preimage, amt, flags, sidecar=None):
             return True
         log_event(cfg, "redeem_failed", fp=fp, status=status,
                   note="body_not_ots_paid_but_unredeemed")
-        return True
+        return _count_refusal(cfg, fp, macaroon, preimage, sidecar, status, "body_not_ots")
     if status == 429:
         wait = _retry_after_secs(headers)
         flags["retry_at"][0] = time.time() + wait
@@ -1402,23 +1585,7 @@ def _redeem(cfg, fp, macaroon, preimage, amt, flags, sidecar=None):
     if status == 503:
         log_event(cfg, "redeem_failed", fp=fp, status=status, note="paid_but_unredeemed")
         return False
-    attempts = (sidecar or {}).get("attempts", 0)
-    attempts = attempts + 1 if isinstance(attempts, int) else 1
-    attention = (sidecar or {}).get("attention") if sidecar else None
-    if attention is None and attempts >= cfg["redeem_attempts_max"]:
-        attention = utc_now_iso()
-        log_event(cfg, "redeem_needs_attention", fp=fp, status=status, attempts=attempts,
-                  note="paid_preimage_kept_retry_every_%ds" % cfg["redeem_attention_retry_secs"])
-    elif attention is None:
-        log_event(cfg, "redeem_failed", fp=fp, status=status, note="paid_but_unredeemed")
-    if sidecar is not None:
-        try:
-            write_sidecar(sidecar_path(cfg, fp), macaroon, sidecar.get("invoice", ""),
-                          preimage, attempts=attempts, attention=attention,
-                          payment_hash=sidecar.get("payment_hash"), amount_sats=sidecar.get("amount_sats"))
-        except OSError:
-            log_event(cfg, "cannot_write_sidecar", fp=fp)
-    return True
+    return _count_refusal(cfg, fp, macaroon, preimage, sidecar, status)
 
 
 def _pay_and_redeem(cfg, password, fp, macaroon, invoice, amt, flags, payment_hash=None):
@@ -1430,10 +1597,10 @@ def _pay_and_redeem(cfg, password, fp, macaroon, invoice, amt, flags, payment_ha
         log_event(cfg, "breaker_probe", pause_secs=int(br["wait"]))
     try:
         preimage = pay_invoice(cfg, password, invoice)
-    except Unreachable:
+    except Unreachable as exc:
         # Unknown outcome: the sidecar stays, and the next pass retries THIS
         # stored invoice, never a fresh challenge — the payment cannot double.
-        _mark_down(cfg, flags, "phoenixd")
+        _mark_down(cfg, flags, "phoenixd", exc)
         log_event(cfg, "payment_outcome_unknown", fp=fp,
                   sats=amt if amt is not None else "unknown")
         return False
@@ -1512,8 +1679,8 @@ def _retry_stored_invoice(cfg, password, fp, sc, macaroon, invoice, flags):
         # them off the stored invoice itself.
         try:
             decoded_amt, decoded_hash = decode_invoice(cfg, password, invoice)
-        except Unreachable:
-            return _mark_down(cfg, flags, "phoenixd")
+        except Unreachable as exc:
+            return _mark_down(cfg, flags, "phoenixd", exc)
         _mark_up(cfg, flags, "phoenixd")
         amt = amt if amt is not None else decoded_amt
         payment_hash = payment_hash or decoded_hash
@@ -1524,8 +1691,8 @@ def _retry_stored_invoice(cfg, password, fp, sc, macaroon, invoice, flags):
             return True
     try:
         outcome, preimage = wallet_payment_outcome(cfg, password, payment_hash)
-    except Unreachable:
-        return _mark_down(cfg, flags, "phoenixd")
+    except Unreachable as exc:
+        return _mark_down(cfg, flags, "phoenixd", exc)
     _mark_up(cfg, flags, "phoenixd")
     if outcome == "paid":
         # Settled at the wallet, answer lost: the preimage is stored and
@@ -1648,8 +1815,8 @@ def buy_one(cfg, password, fp, flags):
 
     try:
         status, headers, body = submit_record(cfg, fp)
-    except Unreachable:
-        return _mark_down(cfg, flags, "gateway")
+    except Unreachable as exc:
+        return _mark_down(cfg, flags, "gateway", exc)
     _mark_up(cfg, flags, "gateway")
     return _buy_challenged(cfg, password, fp, status, headers, body,
                            day, spent, flags)
@@ -1666,7 +1833,7 @@ def _buy_challenged(cfg, password, fp, status, headers, body, day, spent, flags)
         # gateway that does not charge. The bytes are
         # deserialised whole and their attestation nodes inspected before
         # anything is stored or the debt touched.
-        state, reason = inspect_proof(body, fp)
+        state, reason = inspect_proof(body, fp, cfg["max_proof_bytes"])
         if state == INVALID and reason == "digest":
             log_event(cfg, "proof_wrong_digest", fp=fp, note="free",
                       got=(proof_digest(body) or "none")[:12])
@@ -1703,8 +1870,8 @@ def _buy_challenged(cfg, password, fp, status, headers, body, day, spent, flags)
     # gateway's claim (the pay402 rule; fail closed when unreadable).
     try:
         amt, payment_hash = decode_invoice(cfg, password, invoice)
-    except Unreachable:
-        return _mark_down(cfg, flags, "phoenixd")
+    except Unreachable as exc:
+        return _mark_down(cfg, flags, "phoenixd", exc)
     _mark_up(cfg, flags, "phoenixd")
     if amt is None:
         log_event(cfg, "skip", fp=fp, reason="cannot_decode_invoice")
@@ -1815,7 +1982,7 @@ def _buyer_pass_inflight(cfg, password, flags):
                 exc = fut.exception()
                 if exc is not None:
                     if isinstance(exc, Unreachable):
-                        _mark_down(cfg, flags, "gateway")
+                        _mark_down(cfg, flags, "gateway", exc)
                         stop = True
                         continue
                     raise exc
@@ -1896,7 +2063,7 @@ def _apply_upgrade(cfg, fp, path, body):
         except ValueError:
             log_event(cfg, "upgrade_failed", fp=fp, status="bad_base64")
             return False
-        state, reason = inspect_proof(new_bytes, fp)
+        state, reason = inspect_proof(new_bytes, fp, cfg["max_proof_bytes"])
         if state == INVALID and reason == "digest":
             log_event(cfg, "proof_wrong_digest", fp=fp, note="upgrade",
                       got=(proof_digest(new_bytes) or "none")[:12])
@@ -1951,7 +2118,7 @@ def upgrade_pass(cfg, flags):
                     continue
                 except OSError:
                     continue
-                if bitcoin_attestation_present(data):
+                if bitcoin_attestation_present(data, UNCAPPED):
                     # Finished by an earlier pass, whose write may have failed
                     # at its directory fsync and left the marker for this
                     # reason: the barrier is repeated before the marker goes,
@@ -1974,7 +2141,7 @@ def upgrade_pass(cfg, flags):
                 exc = fut.exception()
                 if exc is not None:
                     if isinstance(exc, Unreachable):
-                        _mark_down(cfg, flags, "upgrade_gateway")
+                        _mark_down(cfg, flags, "upgrade_gateway", exc)
                         stop = True
                         continue
                     raise exc
@@ -2062,6 +2229,21 @@ def make_handler(cfg):
         do_GET = do_HEAD = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = \
             _method_not_allowed
 
+        def _browser_post(self):
+            """A browser's POST: one carrying an Origin or a Sec-Fetch-Site
+            header, whatever their values. A page on any other origin
+            could auto-submit a text/plain form here, to which no
+            preflight applies, and have the door write a debt for its
+            bytes and spend budget on them (2026-09-28 Strix pass, 2.03).
+            The first round refused an Origin other than the request's
+            Host; DNS rebinding passes that (a page whose name is rebound
+            to this listener's address submits with an Origin equal to
+            the Host: the 2026-09-29 second round, Opus's rebinding-header
+            probe), and this door serves no page, so no browser request is
+            its own: there is no same-origin exception. A POST with
+            neither header is not a browser's and is unchanged."""
+            return self.headers.get("Origin") is not None or self.headers.get("Sec-Fetch-Site") is not None
+
         def _fingerprint(self):
             """(fp, None) on success; (None, (code, slug, message)) to
             reject; (None, None) when the client vanished mid-body (no reply
@@ -2120,6 +2302,10 @@ def make_handler(cfg):
         def do_POST(self):
             if self.path.split("?", 1)[0] != "/record":
                 self._reply(404, "not found; the only route is POST /record")
+                return
+            if self._browser_post():
+                log_event(cfg, "rejected", reason="browser_post")
+                self._reply(403, "browser POSTs are not accepted: this door serves no page")
                 return
             fp, err = self._fingerprint()
             if fp is None:

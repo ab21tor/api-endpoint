@@ -19,6 +19,7 @@ submissions it holds per fingerprint and in total.
 """
 
 import base64
+import collections
 import hashlib
 import json
 import os
@@ -254,6 +255,12 @@ class FakeGateway:
         self.wrong_digest = False
         # When set, every redeem answers this status with an empty body.
         self.redeem_status_override = None
+        # When set, every redeem answers 200 with exactly these bytes (a
+        # gateway whose 200 is not a proof of anything, or not a proof).
+        self.redeem_body = None
+        # Every redeem request per digest, whatever it was answered with
+        # (the 2026-09-29 second round's counted-refusal tests).
+        self.redeem_requests = collections.Counter()
         outer = self
 
         class H(BaseHTTPRequestHandler):
@@ -318,6 +325,8 @@ class FakeGateway:
                  f'L402 macaroon="{token}", invoice="{invoice}"'})
 
     def _redeem(self, h, digest, auth):
+        with self.lock:
+            self.redeem_requests[digest] += 1
         if self.redeem_status_override is not None:
             h._json(self.redeem_status_override, {"detail": "not now"})
             return
@@ -346,6 +355,9 @@ class FakeGateway:
         if self.redeem_status_override is not None:
             # Set while this redeem stalled (the J9 tests): refuse now.
             h._json(self.redeem_status_override, {"detail": "not now"})
+            return
+        if self.redeem_body is not None:
+            h._raw(200, self.redeem_body, {"Content-Type": "application/octet-stream"})
             return
         h._raw(200, pending_ots(OTHER_DIGEST if self.wrong_digest else fp),
                {"Content-Type": "application/octet-stream"})
@@ -951,6 +963,56 @@ class TestDoor(IntegrationBase):
         self.assertFalse(os.path.exists(self.debt_file(fp)))
         self.assertEqual(len(self.ln.pays_for_fp(fp)), 1)
 
+    def test_browser_posts_are_refused_same_origin_included(self):
+        """2026-09-28 Strix pass, 2.03, and the 2026-09-29 second round: a
+        page on any other origin could auto-submit a text/plain form to
+        /record from a browser that reaches the listener (no preflight
+        applies to a simple form), and the door wrote a debt for
+        attacker-chosen bytes and, with GATEWAY_URL, spent budget on it.
+        The first round refused an Origin other than the request's Host,
+        which let DNS rebinding through: a page whose name is rebound to
+        the listener's address submits with an Origin equal to the Host
+        (Opus's rebinding-header probe: 200 and a debt written). This door
+        serves no page, so no browser request is its own: a POST carrying
+        an Origin or a Sec-Fetch-Site header, whatever their values, is
+        403, logged `rejected reason=browser_post`, and writes nothing; a
+        POST with neither header is not a browser's and is received."""
+        r = self.start_service()
+        body = b"bytes a form on another origin submitted"
+        fp = hashlib.sha256(body).hexdigest()
+        own = f"http://127.0.0.1:{r.port}"
+
+        def post(headers):
+            req = urllib.request.Request(r.url("/record"), data=body, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    return resp.status
+            except urllib.error.HTTPError as e:
+                return e.code
+        refused = [
+            {"Content-Type": "text/plain", "Origin": own},                  # the rebinding shape: Origin equal to Host
+            {"Content-Type": "text/plain", "Origin": own, "Sec-Fetch-Site": "same-origin"},
+            {"Content-Type": "text/plain", "Sec-Fetch-Site": "same-origin"},
+            {"Content-Type": "text/plain", "Sec-Fetch-Site": "none"},
+            {"Content-Type": "text/plain", "Origin": own.upper()},
+            {"Content-Type": "text/plain", "Origin": ""},
+            {"Content-Type": "text/plain", "Origin": "http://attacker.example"},
+            {"Content-Type": "text/plain", "Origin": "http://127.0.0.1:1"},
+            {"Content-Type": "text/plain", "Origin": "null"},
+            {"Content-Type": "text/plain", "Origin": own, "Sec-Fetch-Site": "cross-site"},
+            {"Content-Type": "text/plain", "Sec-Fetch-Site": "cross-site"},
+        ]
+        for headers in refused:
+            self.assertEqual(post(headers), 403, headers)
+        self.assertFalse(os.path.exists(self.debt_file(fp)) or os.path.exists(self.proof_file(fp)),
+                         "a browser POST wrote a debt")
+        log = self.read_service_log()
+        self.assertEqual(log.count("rejected reason=browser_post"), len(refused), log)
+        self.assertNotIn("attacker.example", log)
+        self.assertNotIn(own, log)
+        # Neither header: not a browser's; received as before.
+        self.assertEqual(post_record(r, body)[0], 200)
+        self.wait_settled(fp)
 
 # integration: buyer policy
 class TestBuyerPolicy(IntegrationBase):
@@ -1444,6 +1506,116 @@ class TestRedeemCeiling(IntegrationBase):
         self.assertEqual(len(self.ln.pays_for_fp(fp)), 1)
         self.wait_until(lambda: "attention=0" in open(self.data("heartbeat")).read(),
                         timeout=10, what="heartbeat attention cleared")
+
+    # 2026-09-28 Strix pass, 2.01: a paid redeem answered 200 whose body was
+    # a proof of another digest, bytes that were not one whole proof, or not
+    # a proof at all returned before the attempt accounting: the sidecar
+    # never reached needs-attention, the heartbeat said attention=0 and the
+    # preimage was re-redeemed every pass for ever. Each is a definite
+    # refusal like a 401: counted, marked at the ceiling, retried slowly.
+
+    def _paid_then_200_that_is_not_our_proof(self, answer, **over):
+        r = self.start_service(REDEEM_ATTEMPTS_MAX=3, **over)
+        body = b"paid, then the gateway answers 200 with " + answer.encode()
+        fp = hashlib.sha256(body).hexdigest()
+        if answer == "wrong_digest":
+            self.gw.wrong_digest = True
+        elif answer == "malformed":
+            self.gw.redeem_body = pending_ots(fp)[:-3]
+        else:
+            self.gw.redeem_body = b"<html>not a proof at all</html>"
+        self.assertEqual(post_record(r, body)[0], 200)
+        return r, fp
+
+    def _at_the_ceiling(self, fp, per_attempt, status=200):
+        self.wait_until(lambda: "redeem_needs_attention fp=" + fp in self.read_service_log(),
+                        timeout=30, what="needs-attention event")
+        time.sleep(0.5)
+        log = self.read_service_log()
+        self.assertEqual(log.count("redeem_needs_attention fp=" + fp), 1)
+        self.assertIn("redeem_needs_attention fp=%s status=%s" % (fp, status), log)
+        self.assertIn(per_attempt, log)
+        with open(self.sidecar_file(fp)) as f:
+            sc = json.load(f)
+        self.assertIn("preimage", sc)
+        self.assertEqual(sc["attempts"], 3)
+        self.assertIn("attention", sc)
+        self.assertFalse(os.path.exists(self.proof_file(fp)), "something was stored")
+        self.assertTrue(os.path.exists(self.debt_file(fp)), "the debt stays owed")
+        self.assertEqual(len(self.ln.pays_for_fp(fp)), 1, "never re-paid")
+        self.assertEqual(self.gw.challenges_for(fp), 1, "never re-challenged")
+        self.wait_until(lambda: "attention=1" in open(self.data("heartbeat")).read(),
+                        timeout=10, what="heartbeat attention count")
+
+    def test_a_200_with_a_wrong_digest_counts_toward_the_ceiling(self):
+        r, fp = self._paid_then_200_that_is_not_our_proof("wrong_digest", REDEEM_ATTENTION_RETRY_SECS=1)
+        self._at_the_ceiling(fp, "proof_wrong_digest fp=%s note=paid" % fp)
+        redeems_at_mark = len(self.gw.redeems)
+        time.sleep(0.6)
+        self.assertLessEqual(len([x for x in self.gw.redeems if x == fp]) - redeems_at_mark, 1, "not slowed")
+        # The gateway answers our proof again: the slow retry heals it.
+        self.gw.wrong_digest = False
+        self.wait_settled(fp, timeout=30)
+        self.assertFalse(os.path.exists(self.sidecar_file(fp)))
+        self.assertEqual(len(self.ln.pays_for_fp(fp)), 1)
+        self.wait_until(lambda: "attention=0" in open(self.data("heartbeat")).read(),
+                        timeout=10, what="heartbeat attention cleared")
+
+    def test_a_200_with_a_malformed_proof_counts_toward_the_ceiling(self):
+        r, fp = self._paid_then_200_that_is_not_our_proof("malformed")
+        self._at_the_ceiling(fp, "proof_invalid fp=%s note=paid" % fp)
+
+    def test_a_200_that_is_not_a_proof_counts_toward_the_ceiling(self):
+        r, fp = self._paid_then_200_that_is_not_our_proof("not_ots")
+        self._at_the_ceiling(fp, "redeem_failed fp=%s status=200 note=body_not_ots_paid_but_unredeemed" % fp)
+
+    # 2026-09-29 second round (Opus's cold review of the first round's 2.04
+    # and 2.05): a paid redeem answered with a 3xx, or with a 200 whose body
+    # is over MAX_UPSTREAM_BODY_BYTES, was an Unreachable and counted
+    # nothing: 52 redeems in 4 s, attention=0, breaker ok, where HEAD had
+    # counted the same 302 (attention=1 after 3). A definite answer from
+    # the configured host that this adapter will not take is a refusal
+    # like a 401: counted on the sidecar, marked at the ceiling, retried
+    # slowly. Unreachability proper (refused, timeout, DNS) still counts
+    # nothing.
+
+    def _paid_then_answered_with(self, answer, **over):
+        r = self.start_service(REDEEM_ATTEMPTS_MAX=3, **over)
+        body = b"paid, then the gateway answers the redeem with " + answer.encode()
+        fp = hashlib.sha256(body).hexdigest()
+        ev = self.gw.stall_next_redeem(fp, secs=3.0)
+        self.assertEqual(post_record(r, body)[0], 200)
+        self.assertTrue(ev.wait(20), "redeem never started")
+        if answer == "302":
+            self.gw.redeem_status_override = 302
+        else:
+            self.gw.redeem_body = b"x" * (4096 + 1)
+        return r, fp
+
+    def _counted_at_the_ceiling(self, fp, per_attempt, status):
+        deadline = time.time() + 6
+        while time.time() < deadline and "redeem_needs_attention fp=" + fp not in self.read_service_log():
+            time.sleep(0.05)
+        with self.gw.lock:
+            redeems = self.gw.redeem_requests[fp]
+        # The redeem right after the payment counts nothing (no sidecar
+        # yet), then REDEEM_ATTEMPTS_MAX=3 counted refusals: four requests.
+        self.assertLessEqual(redeems, 4, "%d redeem requests for one paid preimage in 6 s and no "
+                             "needs-attention mark: the answer was never counted" % redeems)
+        self._at_the_ceiling(fp, per_attempt, status)
+        self.assertNotIn("gateway_unreachable", self.read_service_log(),
+                         "a definite answer from the configured host is not an unreachable gateway")
+
+    def test_a_3xx_on_a_paid_redeem_counts_toward_the_ceiling(self):
+        r, fp = self._paid_then_answered_with("302")
+        self._counted_at_the_ceiling(
+            fp, "redeem_failed fp=%s status=302 reason=redirect_302 note=paid_but_unredeemed" % fp, 302)
+
+    def test_a_200_body_over_the_cap_on_a_paid_redeem_counts_toward_the_ceiling(self):
+        r, fp = self._paid_then_answered_with("a body over the cap", MAX_PROOF_BYTES=4096,
+                                              MAX_UPSTREAM_BODY_BYTES=4096)
+        self._counted_at_the_ceiling(
+            fp, "redeem_failed fp=%s status=200 reason=body_over_4096_bytes note=paid_but_unredeemed" % fp, 200)
 
     def test_503_counts_nothing(self):
         r = self.start_service(REDEEM_ATTEMPTS_MAX=2)

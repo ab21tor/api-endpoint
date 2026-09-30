@@ -19,12 +19,14 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import tempfile
 import threading
 import time
 import unittest
 from unittest.mock import patch
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import api_endpoint as a
 from test_api_endpoint import IntegrationBase, post_record
@@ -1074,3 +1076,295 @@ class TestVisibleProofIntake(UnitBase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# 2026-09-28 Strix pass, 2.02: a local actor with write access under
+# DATA_DIR could plant a symbolic or hard link at `log`, or a dangling
+# symlink at a marker path, and the service appended to or created the
+# target outside DATA_DIR. The log append and every marker create now open
+# with O_NOFOLLOW and check the open descriptor: a link at any of those
+# paths is refused and said so (the log's own refusal to stderr, since the
+# log is what is refused).
+class TestLinksRefused(UnitBase):
+    def test_a_link_at_the_log_is_never_written_through(self):
+        outside = Path(self.tmp.name, "outside")
+        outside.write_text("theirs\n")
+        log = Path(self.cfg["log_path"])
+        os.symlink(outside, log)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            a.log_event(self.cfg, "probe", k="v")
+        self.assertEqual(outside.read_text(), "theirs\n", "the log append followed a symbolic link")
+        self.assertIn("link", err.getvalue())
+        log.unlink()
+        os.link(outside, log)
+        with contextlib.redirect_stderr(io.StringIO()):
+            a.log_event(self.cfg, "probe", k="v")
+        self.assertEqual(outside.read_text(), "theirs\n", "the log append wrote through a hard link")
+        log.unlink()
+        a.log_event(self.cfg, "probe", k="v")
+        self.assertIn(" probe k=v", log.read_text(), "a plain log file is written")
+
+    def test_a_link_at_a_marker_path_is_refused(self):
+        planted = Path(self.tmp.name, "planted-by-the-marker")
+        os.symlink(planted, a.pending_path(self.cfg, self.fp))
+        with self.assertRaises(OSError):
+            a.pending_mark(self.cfg, self.fp)
+        self.assertFalse(planted.exists(), "the marker create followed a dangling symlink out of DATA_DIR")
+        a.write_debt(self.cfg, self.fp)
+        self.assertFalse(a.store_proof(self.cfg, self.fp, pending(self.fp)))
+        self.assertTrue(self.exists("debt"))
+        self.assertFalse(self.exists("proof"))
+        self.assertIn("cannot_mark_pending fp=%s err=LinkRefused" % self.fp, self.log())
+        # A hard link at the marker path: refused too.
+        os.unlink(a.pending_path(self.cfg, self.fp))
+        other = Path(self.tmp.name, "other")
+        other.write_bytes(b"")
+        os.link(other, a.pending_path(self.cfg, self.fp))
+        with self.assertRaises(OSError):
+            a.pending_mark(self.cfg, self.fp)
+        os.unlink(a.pending_path(self.cfg, self.fp))
+        # The index flag and the debt: the same refusal.
+        flag = Path(self.cfg["pending_dir"], a.PENDING_BUILT)
+        flag.unlink()
+        os.symlink(Path(self.tmp.name, "planted-by-the-flag"), flag)
+        with self.assertRaises(OSError):
+            a.reconcile_state(self.cfg)
+        self.assertFalse(Path(self.tmp.name, "planted-by-the-flag").exists())
+        flag.unlink()
+        flag.touch()
+        os.symlink(Path(self.tmp.name, "planted-by-the-debt"), a.debt_path(self.cfg, "cd" * 32))
+        with self.assertRaises(OSError):
+            a.write_debt(self.cfg, "cd" * 32)
+        self.assertFalse(Path(self.tmp.name, "planted-by-the-debt").exists())
+
+    def test_the_rule_is_scoped_to_the_final_path_component(self):
+        """The refusal is of a link at the path written: O_NOFOLLOW applies
+        to the last path component only, so a link at one of DATA_DIR's
+        directories is followed, the directory layout being the operator's
+        (2026-09-29 second round, 2.02: the README claimed nothing under
+        DATA_DIR was written through a link)."""
+        elsewhere = Path(self.tmp.name, "elsewhere")
+        elsewhere.mkdir()
+        pending_dir = Path(self.cfg["pending_dir"])
+        shutil.rmtree(pending_dir)
+        os.symlink(elsewhere, pending_dir)
+        a.pending_mark(self.cfg, self.fp)
+        self.assertTrue((elsewhere / self.fp).exists(), "a linked directory is the operator's layout, not a link at the path")
+
+
+class _Loopback:
+    """A loopback HTTP server whose answer the test sets: (status, headers,
+    body) per request, every request recorded as (path, headers)."""
+
+    def __init__(self, answer):
+        self.answer = answer
+        self.requests = []
+        outer = self
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _serve(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                if n:
+                    self.rfile.read(n)
+                outer.requests.append((self.path, dict(self.headers)))
+                status, headers, body = outer.answer(self.path)
+                self.send_response(status)
+                for k, v in headers.items():
+                    self.send_header(k, v)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                except OSError:
+                    pass
+            do_GET = do_POST = _serve
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.server.daemon_threads = True
+        self.url = "http://127.0.0.1:%d" % self.server.server_address[1]
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+# 2026-09-28 Strix pass, 2.04: urllib followed 301/302/303 (POST to GET)
+# and 301-308 (GET) and kept the Authorization header, so a redirecting
+# upstream received GATEWAY_UPGRADE_TOKEN, the L402 preimage or the phoenixd
+# password at another host. Neither http_post nor http_get follows a
+# redirect now: a 3xx is an Unreachable naming the code, the caller names
+# the upstream (`gateway_unreachable err=redirect_302`), and no header is
+# ever sent anywhere but the configured URL.
+class TestNoRedirects(UnitBase):
+    def setUp(self):
+        super().setUp()
+        self.sink = _Loopback(lambda path: (200, {}, b"sunk"))
+        self.addCleanup(self.sink.close)
+        self.code = 302
+        self.hop = _Loopback(lambda path: (self.code, {"Location": self.sink.url + "/sink" + path}, b"moved"))
+        self.addCleanup(self.hop.close)
+
+    def test_no_redirect_is_followed_and_no_header_leaves_the_configured_host(self):
+        for code in (301, 302, 303, 307, 308):
+            self.code = code
+            with self.assertRaises(a.Unreachable) as cm:
+                a.http_post(self.hop.url + "/timestamp", b"{}", {"Authorization": "Bearer secret-token"}, timeout=5)
+            self.assertEqual(str(cm.exception), "redirect_%d" % code)
+            with self.assertRaises(a.Unreachable) as cm:
+                a.http_get(self.hop.url + "/payments/incoming/x", timeout=5, headers={"Authorization": "Basic secret"})
+            self.assertEqual(str(cm.exception), "redirect_%d" % code)
+        self.assertEqual(self.sink.requests, [], "a header travelled to the redirect's host")
+        self.assertEqual(len(self.hop.requests), 10)
+
+    def test_the_callers_name_the_upstream(self):
+        self.cfg["gateway_url"] = self.hop.url
+        self.cfg["phoenixd_url"] = self.hop.url
+        f = flags()
+        # A 3xx on a paid redeem is a definite answer from the configured
+        # host: a refusal, counted on the sidecar (2026-09-29 second round;
+        # the first round made it an unreachable gateway and counted
+        # nothing, where HEAD had counted it), never an unreachable gateway.
+        sc = {"macaroon": "bWFj", "invoice": "lnbc1", "preimage": "ab" * 32, "attempts": 1}
+        self.cfg["redeem_attempts_max"] = 2
+        self.assertTrue(a._redeem(self.cfg, self.fp, "bWFj", "ab" * 32, 21, f, sidecar=sc))
+        self.assertIn("redeem_failed fp=%s status=302 reason=redirect_302 note=paid_but_unredeemed" % self.fp, self.log())
+        self.assertIn("redeem_needs_attention fp=%s status=302 attempts=2 reason=redirect_302" % self.fp, self.log())
+        self.assertNotIn("gateway_unreachable", self.log())
+        with open(a.sidecar_path(self.cfg, self.fp)) as fh:
+            written = json.load(fh)
+        self.assertEqual((written["attempts"], written["preimage"]), (2, "ab" * 32))
+        self.assertIn("attention", written)
+        # A 3xx anywhere else is the unreachable class it always was, named.
+        with self.assertRaises(a.Unreachable) as cm:
+            a.decode_invoice(self.cfg, "pw", "lnbc1")
+        self.assertEqual(str(cm.exception), "redirect_302")
+        self.assertEqual(self.sink.requests, [])
+        self.assertTrue(all(h.get("Authorization") for _, h in self.hop.requests), "the hop is the configured host: headers go there")
+
+
+# 2026-09-28 Strix pass, 2.05: no total proof-size cap and no upstream body
+# cap. A syntactically valid 10 MB proof of forked unknown attestations and
+# one pending one was classified pending, stored and re-polled, and
+# resp.read() was unbounded. Two configurable caps: a proof over
+# MAX_PROOF_BYTES is INVALID with the size in the reason, and an upstream
+# body over MAX_UPSTREAM_BODY_BYTES is an Unreachable naming the size;
+# neither ever yields a truncated proof.
+class TestSizeCaps(UnitBase):
+    def oversized(self):
+        head = a.OTS_MAGIC + b"\x01\x08" + bytes.fromhex(self.fp)
+        payload = b"x" * 4096
+        unknown = b"\xff\x00" + bytes.fromhex("abababababababab") + a.varuint(len(payload)) + payload
+        data = head + unknown * 300 + pending_attestation()
+        self.assertGreater(len(data), a.MAX_PROOF_BYTES_DEFAULT)
+        return data
+
+    def test_an_oversized_proof_is_invalid_naming_its_size_and_the_debt_stays(self):
+        data = self.oversized()
+        state, reason = a.inspect_proof(data, self.fp)
+        self.assertEqual(state, a.INVALID, reason)
+        self.assertIn(str(len(data)), reason)
+        self.assertIn(str(a.MAX_PROOF_BYTES_DEFAULT), reason)
+        for reader in (a.parse_ots, a.proof_attestations):
+            with self.assertRaises(a.OtsError) as cm:
+                reader(data)
+            self.assertIn(str(len(data)), str(cm.exception))
+        self.assertFalse(a.bitcoin_attestation_present(data))
+        # The same bytes under a cap they fit: the size was the only objection.
+        self.assertEqual(a.inspect_proof(data, self.fp, max_bytes=len(data)), (a.PENDING, "pending"))
+        a.write_debt(self.cfg, self.fp)
+        a._buy_challenged(self.cfg, None, self.fp, 200, {}, data, a.utc_today(), 0, flags())
+        self.assertFalse(self.exists("proof"))
+        self.assertFalse(self.exists("marker"))
+        self.assertTrue(self.exists("debt"))
+        self.assertIn("proof_invalid fp=%s note=free reason=" % self.fp, self.log())
+        # The configured cap is what the buyer applies.
+        self.cfg["max_proof_bytes"] = len(data)
+        a._buy_challenged(self.cfg, None, self.fp, 200, {}, data, a.utc_today(), 0, flags())
+        self.assertTrue(self.exists("proof"))
+
+    def test_an_upstream_body_over_the_cap_is_an_error_naming_the_size_never_a_truncated_body(self):
+        cap = self.cfg["max_upstream_body_bytes"]
+        size = [cap + 1]
+        server = _Loopback(lambda path: (200, {"Content-Type": "application/octet-stream"}, b"y" * size[0]))
+        self.addCleanup(server.close)
+        for call in (lambda: a.http_get(server.url + "/big", timeout=10),
+                     lambda: a.http_post(server.url + "/big", b"{}", {}, timeout=10)):
+            with self.assertRaises(a.Unreachable) as cm:
+                call()
+            self.assertEqual(str(cm.exception), "body_over_%d_bytes" % cap)
+        size[0] = cap
+        status, _, body = a.http_get(server.url + "/big", timeout=10)
+        self.assertEqual((status, len(body)), (200, cap), "a body at the cap arrives whole")
+        # A paid redeem answered with such a body: a definite answer from the
+        # configured host, so a counted refusal naming the cap (2026-09-29
+        # second round), nothing stored.
+        size[0] = cap + 1
+        self.cfg["gateway_url"] = server.url
+        sc = {"macaroon": "bWFj", "invoice": "lnbc1", "preimage": "ab" * 32}
+        self.assertTrue(a._redeem(self.cfg, self.fp, "bWFj", "ab" * 32, 21, flags(), sidecar=sc))
+        self.assertIn("redeem_failed fp=%s status=200 reason=body_over_%d_bytes note=paid_but_unredeemed" % (self.fp, cap), self.log())
+        self.assertNotIn("gateway_unreachable", self.log())
+        with open(a.sidecar_path(self.cfg, self.fp)) as fh:
+            self.assertEqual(json.load(fh)["attempts"], 1)
+        self.assertFalse(self.exists("proof"))
+
+    def test_the_cap_applies_at_intake_only_a_stored_proof_survives_a_lowered_cap(self):
+        """2026-09-29 second round (Opus's 97-byte probe): the first round
+        applied MAX_PROOF_BYTES wherever a proof was read, so a cap lowered
+        below the size of a proof already stored made the next start's
+        reconciliation set the proof aside and re-create its debt (the
+        buyer bought it again), the door write a new debt for its
+        fingerprint, the index skip it and the upgrader read an anchored
+        one as unfinished. The cap is an intake rule: a stored proof is
+        read whole, whatever the cap."""
+        proof = pending(self.fp)
+        self.store(proof)                       # under the default cap
+        self.assertTrue(self.exists("proof") and self.exists("marker") and not self.exists("debt"))
+        self.cfg["max_proof_bytes"] = 64
+        self.assertLess(64, len(proof))
+        counts = a.reconcile_state(self.cfg)
+        self.assertEqual(counts.get("invalid_requeued", 0), 0,
+                         "the reconciliation set a stored proof aside for a cap it predates: %s" % counts)
+        self.assertTrue(self.exists("proof") and self.exists("marker") and not self.exists("debt"))
+        self.assertEqual(sorted(os.listdir(self.cfg["proofs_dir"])), [self.fp + ".ots"])
+        self.assertTrue(a.proof_on_disk(self.cfg, self.fp), "the door would write a new debt for a proof it holds")
+        # The index: a stored pending proof gets its marker whatever the cap.
+        a.pending_clear(self.cfg, self.fp)
+        Path(self.cfg["pending_dir"], a.PENDING_BUILT).unlink()
+        self.assertEqual(a.build_pending_index(self.cfg), (1, 1))
+        # The upgrader: a stored anchored proof over the cap is finished,
+        # its marker cleared, nothing asked upstream.
+        other = "cd" * 32
+        a.atomic_write(a.proof_path(self.cfg, other), anchored(other))
+        a.pending_mark(self.cfg, other)
+        a.pending_clear(self.cfg, self.fp)      # only the anchored one is in the index for this pass
+        a.upgrade_pass(self.cfg, {"upgrade_gateway": a.StateChange()})
+        self.assertFalse(self.exists("marker", other), "an anchored proof over a lowered cap was read as unfinished")
+        self.assertNotIn("upgrade_gateway_unreachable", self.log())
+        self.assertTrue(self.exists("proof", other))
+        # The cap holds at intake: the same shape arriving now is refused and its debt kept.
+        third = "ef" * 32
+        a.write_debt(self.cfg, third)
+        a._buy_challenged(self.cfg, None, third, 200, {}, pending(third), a.utc_today(), 0, flags())
+        self.assertFalse(self.exists("proof", third))
+        self.assertTrue(self.exists("debt", third))
+        self.assertIn("proof_invalid fp=%s note=free reason=proof_of_%d_bytes_over_the_64-byte_cap" % (third, len(pending(third))), self.log())
+
+    def test_the_caps_are_configured_and_checked(self):
+        base = {"LISTEN_ADDR": "127.0.0.1:8402", "CALENDAR_URL": "http://unused", "DATA_DIR": self.tmp.name}
+        cfg = a.resolve_config(base, script_dir=self.tmp.name)
+        self.assertEqual(cfg["max_proof_bytes"], a.MAX_PROOF_BYTES_DEFAULT)
+        self.assertEqual(cfg["max_upstream_body_bytes"], a.MAX_UPSTREAM_BODY_BYTES_DEFAULT)
+        cfg = a.resolve_config({**base, "MAX_PROOF_BYTES": "4096", "MAX_UPSTREAM_BODY_BYTES": "8192"},
+                               script_dir=self.tmp.name)
+        self.assertEqual((cfg["max_proof_bytes"], cfg["max_upstream_body_bytes"]), (4096, 8192))
+        for bad in ({"MAX_PROOF_BYTES": "0"}, {"MAX_PROOF_BYTES": "lots"},
+                    {"MAX_UPSTREAM_BODY_BYTES": "-1"},
+                    {"MAX_PROOF_BYTES": "8192", "MAX_UPSTREAM_BODY_BYTES": "4096"}):
+            with self.assertRaises(a.ConfigError):
+                a.resolve_config({**base, **bad}, script_dir=self.tmp.name)
